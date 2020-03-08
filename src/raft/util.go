@@ -5,7 +5,7 @@ import "math/rand"
 import "time"
 
 // Debugging
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -26,4 +26,11 @@ func init() {
 
 func RandIntRange(left int, right int) int {
 	return left + rand.Intn(right-left)
+}
+
+func Min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
