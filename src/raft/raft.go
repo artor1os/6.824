@@ -291,11 +291,13 @@ func (rf *Raft) elect(timeout time.Duration) {
 
 // waitForElect goroutine
 func (rf *Raft) waitForElect() {
+	genTimeout := func() time.Duration { return time.Duration(RandIntRange(eTimeoutLeft, eTimeoutRight)) * time.Millisecond }
+	eTimeout := genTimeout()
 	for {
-		eTimeout := time.Duration(RandIntRange(eTimeoutLeft, eTimeoutRight)) * time.Millisecond
 		timer := time.NewTimer(eTimeout)
 		select {
 		case <-timer.C:
+			eTimeout = genTimeout()
 			if rf.killed() {
 				timer.Stop()
 				return
@@ -361,17 +363,19 @@ type RequestVoteReply struct {
 }
 
 func (rf *Raft) isUptodate(lastLogIndex int, lastLogTerm int) bool {
-	if len(rf.log) == 0 {
-		return true
-	}
+	var ret bool
 	myLastLog := rf.log[len(rf.log)-1]
 	if myLastLog.Term < lastLogTerm {
-		return true
+		ret = true
 	}
 	if myLastLog.Term == lastLogTerm {
-		return len(rf.log)-1 <= lastLogIndex
+		ret = len(rf.log)-1 <= lastLogIndex
 	}
-	return false
+	if myLastLog.Term > lastLogTerm {
+		ret = false
+	}
+	rf.say("isUpdate? ", ret, " lastLogIndex ", lastLogIndex, " lastLogTerm ", lastLogTerm, " myLastLogIndex ", len(rf.log)-1, " myLasterLogTerm ", myLastLog.Term)
+	return ret
 }
 
 //
@@ -517,7 +521,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) updateMatchIndex(server int, index int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.killed() || rf.matchIndex[server] == index {
+	if rf.killed() || rf.matchIndex[server] >= index {
 		return
 	}
 	rf.say("update match index of ", server, " from ", rf.matchIndex[server], " to ", index)
@@ -541,6 +545,7 @@ func (rf *Raft) updateMatchIndex(server int, index int) {
 
 // appendEntries goroutine
 func (rf *Raft) appendEntries(server int, firstNext int, heartbeat bool) {
+	rf.say("send appendEntries to ", server, " firstNext ", firstNext, " isHeartbeat? ", heartbeat)
 	n := firstNext
 	args := AppendEntriesArgs{}
 	args.LeaderId = rf.me
@@ -574,6 +579,7 @@ func (rf *Raft) appendEntries(server int, firstNext int, heartbeat bool) {
 			// match log
 			if reply.Success {
 				match := args.PrevLogIndex + len(args.Entries)
+				rf.say("update next index of ", server, " from ", rf.nextIndex[server], " to ", match + 1)
 				rf.nextIndex[server] = match + 1
 				go rf.updateMatchIndex(server, match)
 				rf.mu.Unlock()
