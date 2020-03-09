@@ -227,7 +227,7 @@ func (rf *Raft) acceptNewerTerm(inTerm int, vote int) {
 		rf.currentTerm = inTerm
 		rf.role = follower
 		rf.votedFor = vote // NOTE: very important
-		rf.persist()
+		// rf.persist()
 	}
 	rf.mu.Unlock()
 	if isNolongerLeader {
@@ -270,7 +270,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	oldVote := rf.votedFor
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		if rf.isCandidateUptodate(args.LastLogIndex, args.LastLogTerm) {
 			reply.VoteGranted = true
@@ -279,9 +278,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = false
 			rf.votedFor = -1
 		}
-		if rf.votedFor != oldVote {
-			rf.persist()
-		}
+		rf.persist()
 	}
 
 	rf.say("RequestVote: voteGranted? %v, votedFor %v", reply.VoteGranted, rf.votedFor)
@@ -551,8 +548,8 @@ loop:
 }
 
 const heartbeatInterval = 150 * time.Millisecond
-const eTimeoutLeft = 200
-const eTimeoutRight = 300
+const eTimeoutLeft = 400
+const eTimeoutRight = 600
 
 // notify goroutine
 func (rf *Raft) notify() {
