@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -46,23 +46,57 @@ type KVServer struct {
 	// Your definitions here.
 	store map[string]string
 
-	indexCh map[int]chan struct{}
+	indexCh map[int]chan int
 }
 
 func (kv *KVServer) apply() {
 	for am := range kv.applyCh {
 		op := am.Command.(Op)
-		DPrintf("apply: op: %v, index %v", op, am.CommandIndex)
-		if ch, ok := kv.indexCh[am.CommandIndex]; ok {
+		DPrintf("apply: op: %#v, index %v", op, am.CommandIndex)
+		kv.mu.Lock()
+		var ch chan int
+		var ok bool
+		if ch, ok = kv.indexCh[am.CommandIndex]; ok {
 			select {
 			case <-ch:
 			default:
 			}
 		} else {
-			kv.indexCh[am.CommandIndex] = make(chan struct{}, 1)
+			ch = make(chan int, 1)
+			kv.indexCh[am.CommandIndex] = ch
 		}
-		kv.indexCh[am.CommandIndex] <- struct{}{}
+		kv.applyOp(&op)
+		kv.mu.Unlock()
+		ch <- 1
 	}
+}
+
+func (kv *KVServer) applyOp(op *Op) {
+	switch op.Type {
+	case PutOp:
+		kv.store[op.Key] = op.Value
+	case AppendOp:
+		kv.store[op.Key] += op.Value
+	}
+}
+
+func (kv *KVServer) get(key string) (value string, ok bool) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	value, ok = kv.store[key]
+	return
+}
+
+func (kv *KVServer) waitIndexCommit(index int) int {
+	kv.mu.Lock()
+	var ch chan int
+	var ok bool
+	if ch, ok = kv.indexCh[index]; !ok {
+		ch = make(chan int)
+		kv.indexCh[index] = ch
+	}
+	kv.mu.Unlock()
+	return <-ch
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -74,17 +108,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	// block on index
-	if ch, ok := kv.indexCh[index]; ok {
-		<- ch
-	} else {
-		kv.indexCh[index] = make(chan struct{})
-	}
-	<-kv.indexCh[index]
+	kv.waitIndexCommit(index)
 
 	var ok bool
-	kv.mu.Lock()
-	reply.Value, ok = kv.store[args.Key]
-	kv.mu.Unlock()
+	reply.Value, ok = kv.get(args.Key)
 	if !ok {
 		reply.Err = ErrNoKey
 	} else {
@@ -101,22 +128,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	// block on index
-	if ch, ok := kv.indexCh[index]; ok {
-		<- ch
-	} else {
-		kv.indexCh[index] = make(chan struct{})
-	}
-	<-kv.indexCh[index]
+	kv.waitIndexCommit(index)
 
-	kv.mu.Lock()
-	switch args.Op {
-	case PutOp:
-		kv.store[args.Key] = args.Value
-	case AppendOp:
-		kv.store[args.Key] = kv.store[args.Key] + args.Value
-	}
-	kv.mu.Unlock()
-	
 	reply.Err = OK
 }
 
@@ -169,7 +182,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.store = make(map[string]string)
-	kv.indexCh = make(map[int]chan struct{})
+	kv.indexCh = make(map[int]chan int)
 	// You may need initialization code here.
 	go kv.apply()
 
