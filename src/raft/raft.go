@@ -183,7 +183,7 @@ func (rf *Raft) readPersist(data []byte) {
 	var log Logs
 
 	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
-		rf.say("readPersist: fail")
+		//rf.say("readPersist: fail")
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
@@ -230,7 +230,7 @@ func (rf *Raft) acceptNewerTerm(inTerm int, vote int) {
 	// If RPC request or response contains term T > currentTerm:
 	// set currentTerm = T, convert to follower
 	if inTerm > rf.currentTerm {
-		rf.say("acceptNewerTerm: inTerm %v is newer than currentTerm %v, become follower", inTerm, rf.currentTerm)
+		//rf.say("acceptNewerTerm: inTerm %v is newer than currentTerm %v, become follower", inTerm, rf.currentTerm)
 		if rf.role == leader {
 			isNolongerLeader = true
 		}
@@ -241,9 +241,9 @@ func (rf *Raft) acceptNewerTerm(inTerm int, vote int) {
 	}
 	rf.mu.Unlock()
 	if isNolongerLeader {
-		rf.say("acceptNewerTerm: no longer leader, send resign to channel")
+		//rf.say("acceptNewerTerm: no longer leader, send resign to channel")
 		rf.resignCh <- struct{}{}
-		rf.say("not block")
+		//rf.say("not block")
 	}
 }
 
@@ -264,8 +264,8 @@ func (rf *Raft) isCandidateUptodate(lastLogIndex int, lastLogTerm int) bool {
 	if myLastLog.Term > lastLogTerm {
 		ret = false
 	}
-	rf.say("isCandidateUptodate: %v, lastLogIndex %v, lastLogTerm %v, myLastLogIndex %v, myLasterLogTerm %v",
-		ret, lastLogIndex, lastLogTerm, len(rf.log)-1, myLastLog.Term)
+	//rf.say("isCandidateUptodate: %v, lastLogIndex %v, lastLogTerm %v, myLastLogIndex %v, myLasterLogTerm %v",
+		//ret, lastLogIndex, lastLogTerm, len(rf.log)-1, myLastLog.Term)
 	return ret
 }
 
@@ -280,7 +280,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// [raft-paper, RequestVoteRPC receiver]
 	// Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
-		rf.say("RequestVote: stale from %v", args.CandidateId)
+		//rf.say("RequestVote: stale from %v", args.CandidateId)
 		reply.VoteGranted = false
 		rf.mu.Unlock()
 		return
@@ -299,7 +299,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.persist()
 	}
 
-	rf.say("RequestVote: voteGranted? %v, votedFor %v", reply.VoteGranted, rf.votedFor)
+	//rf.say("RequestVote: voteGranted? %v, votedFor %v", reply.VoteGranted, rf.votedFor)
 	isVoted := rf.role == follower && reply.VoteGranted
 	rf.mu.Unlock()
 	if isVoted {
@@ -307,9 +307,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// If eleciton timeout elapses without 
 		// receiving AppendEntries RPC from current leader 
 		// or granting vote to candidate: convert to candidate
-		rf.say("RequestVote: send reset to channel")
+		//rf.say("RequestVote: send reset to channel")
 		rf.resetCh <- struct{}{}
-		rf.say("not block")
+		//rf.say("not block")
 	}
 }
 
@@ -345,7 +345,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	// lock should be unheld
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	if ok && args.Term == rf.currentTerm {
+	if ok {
 		rf.acceptNewerTerm(reply.Term, server)
 	}
 	return ok
@@ -379,7 +379,7 @@ func (rf *Raft) apply() {
 	if rf.killed() {
 		return
 	}
-	rf.say("apply: lastApplied %v, commitIndex %v", rf.lastApplied, rf.commitIndex)
+	//rf.say("apply: lastApplied %v, commitIndex %v", rf.lastApplied, rf.commitIndex)
 	// [raft-paper, all-servers]
 	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
@@ -394,7 +394,7 @@ func (rf *Raft) apply() {
 
 // lock should be held by caller
 func (rf *Raft) updateCommitIndex(index int) {
-	rf.say("updateCommitIndex: from %v to %v", rf.commitIndex, index)
+	//rf.say("updateCommitIndex: from %v to %v", rf.commitIndex, index)
 	rf.commitIndex = index
 	go rf.apply()
 }
@@ -406,7 +406,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// [raft-paper, AppendEntriesRPC receiver]
 	// reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
-		rf.say("AppendEntries: stale from %v", args.LeaderId)
+		//rf.say("AppendEntries: stale from %v", args.LeaderId)
 		reply.Success = false
 		rf.mu.Unlock()
 		return
@@ -416,7 +416,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.role == candidate {
 		// [raft-paper, candidate]
 		// If AppendEntries RPC received from new leader: convert to follower
-		rf.say("AppendEntries: candidate become follower")
+		//rf.say("AppendEntries: candidate become follower")
 		rf.role = follower
 	}
 	if rf.role == follower {
@@ -425,16 +425,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// receiving AppendEntries RPC from current leader 
 		// or granting vote to candidate: convert to candidate
 		rf.mu.Unlock()
-		rf.say("AppendEntries: send reset to channel")
+		//rf.say("AppendEntries: send reset to channel")
 		rf.resetCh <- struct{}{}
-		rf.say("not block")
+		//rf.say("not block")
 		rf.mu.Lock()
 	}
 
 	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		// [raft-paper, AppendEntriesRPC receiver]
 		// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
-		rf.say("AppendEntries: mismatch, prevLogIndex %v, prevLogTerm %v\nmy log %s", args.PrevLogIndex, args.PrevLogTerm, rf.log)
+		//rf.say("AppendEntries: mismatch, prevLogIndex %v, prevLogTerm %v\nmy log %s", args.PrevLogIndex, args.PrevLogTerm, rf.log)
 		reply.Success = false
 
 		last := Min(args.PrevLogIndex, len(rf.log)-1)
@@ -451,13 +451,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 			reply.FirstConflictIndex = last
 		}
-		rf.say("AppendEntries: conflictTerm %v, firstConflictIndex %v", reply.ConflictTerm, reply.FirstConflictIndex)
+		//rf.say("AppendEntries: conflictTerm %v, firstConflictIndex %v", reply.ConflictTerm, reply.FirstConflictIndex)
 		rf.mu.Unlock()
 		return
 	}
 
 	if args.Entries != nil { // not a heartbeat
-		rf.say("AppendEntries: entries %v", args.Entries)
+		//rf.say("AppendEntries: entries %v", args.Entries)
 		l := len(rf.log)
 		start := args.PrevLogIndex + 1
 		i := start
@@ -486,7 +486,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// [raft-paper, AppendEntriesRPC receiver]
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
-		rf.say("AppendEntries: leaderCommit %v is newer than commitIndex %v", args.LeaderCommit, rf.commitIndex)
+		//rf.say("AppendEntries: leaderCommit %v is newer than commitIndex %v", args.LeaderCommit, rf.commitIndex)
 		rf.updateCommitIndex(Min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries)))
 	}
 
@@ -497,7 +497,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	// lock should be unheld
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if ok && args.Term == rf.currentTerm {
+	if ok {
 		rf.acceptNewerTerm(reply.Term, server)
 	}
 	return ok
@@ -514,7 +514,7 @@ func (rf *Raft) updateMatchIndex(server int, index int) {
 	if rf.killed() || rf.matchIndex[server] >= index {
 		return
 	}
-	rf.say("updateMatchIndex: of server %v, from %v to %v", server, rf.matchIndex[server], index)
+	//rf.say("updateMatchIndex: of server %v, from %v to %v", server, rf.matchIndex[server], index)
 	rf.matchIndex[server] = index
 
 	// [raft-paper]If there exists an N such that N > commitIndex, a majority of matchIndex[i] >= N, 
@@ -585,8 +585,8 @@ func (rf *Raft) appendEntries(server int) {
 
 				rf.nextIndex[server] = index + 1
 
-				rf.say("appendEntries: mismatch, prevLogIndex %v, prevLogTerm %v, conflictTerm %v, firstConflictIndex %v\nmy log %s\ndecrement next to %v",
-					args.PrevLogIndex, args.PrevLogTerm, reply.ConflictTerm, reply.FirstConflictIndex, rf.log, index+1)
+				//rf.say("appendEntries: mismatch, prevLogIndex %v, prevLogTerm %v, conflictTerm %v, firstConflictIndex %v\nmy log %s\ndecrement next to %v",
+					//args.PrevLogIndex, args.PrevLogTerm, reply.ConflictTerm, reply.FirstConflictIndex, rf.log, index+1)
 
 				rf.mu.Unlock()
 				continue
@@ -617,13 +617,13 @@ func (rf *Raft) notify() {
 					if i == rf.me {
 						continue
 					}
-					rf.say("notify: to %v", i)
+					//rf.say("notify: to %v", i)
 					go rf.appendEntries(i)
 				}
 			}
 			rf.mu.Unlock()
 		case <-rf.resignCh:
-			rf.say("notify: resign")
+			//rf.say("notify: resign")
 			go rf.wait()
 			return
 		}
@@ -674,6 +674,8 @@ func (rf *Raft) campaign() (elected chan struct{}) {
 			go func(server int) {
 				reply := RequestVoteReply{}
 				ok := rf.sendRequestVote(server, &args, &reply)
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
 				if ok && args.Term == rf.currentTerm && reply.VoteGranted {
 					voteCh <- struct{}{}
 				}
@@ -706,12 +708,12 @@ func (rf *Raft) wait() {
 			}
 			if rf.role == candidate {
 				// [raft-paper]If election timeout elapses: start new election
-				rf.say("wait: election timeout, start a new election")
+				//rf.say("wait: election timeout, start a new election")
 				elected = rf.campaign()
 			}
 			rf.mu.Unlock()
 		case <-rf.resetCh:
-			rf.say("wait: reset election timeout")
+			//rf.say("wait: reset election timeout")
 			elected = make(chan struct{})
 			continue
 		case <-elected:
@@ -721,7 +723,7 @@ func (rf *Raft) wait() {
 				continue
 			}
 			rf.role = leader
-			rf.say("wait: become leader")
+			//rf.say("wait: become leader")
 
 			rf.nextIndex = make([]int, len(rf.peers))
 			for i := range rf.nextIndex {
@@ -735,9 +737,9 @@ func (rf *Raft) wait() {
 			// repeat during idle periods to prevent election timeout
 			go rf.notify()
 			rf.mu.Unlock()
-			rf.say("wait: trigger initial heartbeat")
+			//rf.say("wait: trigger initial heartbeat")
 			rf.notifyCh <- struct{}{}
-			rf.say("not block")
+			//rf.say("not block")
 			return
 		}
 	}
@@ -773,7 +775,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	index = len(rf.log)
 	term = rf.currentTerm
 	isLeader = true
-	rf.say("Start: index %v, term %v", index, term)
+	//rf.say("Start: index %v, term %v", index, term)
 	// [raft-paper]If command received from client: append entry to local log,
 	// respond after entry applied to state machine
 	rf.log = append(rf.log, &LogEntry{Command: command, Term: rf.currentTerm})
