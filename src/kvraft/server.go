@@ -1,12 +1,14 @@
 package kvraft
 
 import (
-	"../labgob"
-	"../labrpc"
 	"log"
-	"../raft"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"../labgob"
+	"../labrpc"
+	"../raft"
 )
 
 const Debug = 0
@@ -26,6 +28,11 @@ type Op struct {
 	Type string
 	Key string
 	Value string
+	KeyNotExist bool
+	RID int
+	CID int64
+
+	WrongLeader bool
 }
 
 const (
@@ -46,15 +53,15 @@ type KVServer struct {
 	// Your definitions here.
 	store map[string]string
 
-	indexCh map[int]chan int
+	indexCh map[int]chan *Op
+	lastCommited map[int64]int
 }
 
 func (kv *KVServer) apply() {
 	for am := range kv.applyCh {
 		op := am.Command.(Op)
-		DPrintf("apply: op: %#v, index %v", op, am.CommandIndex)
 		kv.mu.Lock()
-		var ch chan int
+		var ch chan *Op
 		var ok bool
 		if ch, ok = kv.indexCh[am.CommandIndex]; ok {
 			select {
@@ -62,73 +69,108 @@ func (kv *KVServer) apply() {
 			default:
 			}
 		} else {
-			ch = make(chan int, 1)
+			ch = make(chan *Op, 1)
 			kv.indexCh[am.CommandIndex] = ch
 		}
 		kv.applyOp(&op)
 		kv.mu.Unlock()
-		ch <- 1
+		ch <- &op
 	}
+}
+
+func (kv *KVServer) isDup(op *Op) bool {
+	lastCommited, ok := kv.lastCommited[op.CID]
+	if !ok {
+		return false
+	}
+	return op.RID <= lastCommited
 }
 
 func (kv *KVServer) applyOp(op *Op) {
 	switch op.Type {
 	case PutOp:
-		kv.store[op.Key] = op.Value
+		if !kv.isDup(op) {
+			kv.store[op.Key] = op.Value
+		}
 	case AppendOp:
-		kv.store[op.Key] += op.Value
+		if !kv.isDup(op) {
+			kv.store[op.Key] += op.Value
+		}
+	case GetOp:
+		v, ok := kv.store[op.Key]
+		if !ok {
+			op.KeyNotExist = true
+		} else {
+			op.KeyNotExist = false
+			op.Value = v
+		}
+	}
+	if !kv.isDup(op) {
+		kv.lastCommited[op.CID] = op.RID
 	}
 }
 
-func (kv *KVServer) get(key string) (value string, ok bool) {
+func (kv *KVServer) waitIndexCommit(index int, cid int64, rid int) *Op {
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	value, ok = kv.store[key]
-	return
-}
-
-func (kv *KVServer) waitIndexCommit(index int) int {
-	kv.mu.Lock()
-	var ch chan int
+	var ch chan *Op
 	var ok bool
 	if ch, ok = kv.indexCh[index]; !ok {
-		ch = make(chan int)
+		ch = make(chan *Op, 1)
 		kv.indexCh[index] = ch
 	}
 	kv.mu.Unlock()
-	return <-ch
+	select {
+	case op := <-ch:
+		if op.CID != cid || op.RID != rid {
+			return &Op{WrongLeader: true}
+		}
+		return op
+	case <-time.After(time.Millisecond * 300):
+		return &Op{WrongLeader: true}
+	}
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	index, _, isLeader := kv.rf.Start(Op{Type: GetOp, Key: args.Key})
+	newOp := Op{Type: GetOp, RID: args.RID, CID: args.CID, Key: args.Key}
+	index, _, isLeader := kv.rf.Start(newOp)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
 
 	// block on index
-	kv.waitIndexCommit(index)
+	op := kv.waitIndexCommit(index, args.CID, args.RID)
 
-	var ok bool
-	reply.Value, ok = kv.get(args.Key)
-	if !ok {
+	if op.WrongLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	if op.KeyNotExist {
 		reply.Err = ErrNoKey
 	} else {
 		reply.Err = OK
+		reply.Value = op.Value
 	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	index, _, isLeader := kv.rf.Start(Op{Type: args.Op, Key: args.Key, Value: args.Value})
+	newOp := Op{Type: args.Op, RID: args.RID, CID: args.CID, Key: args.Key, Value: args.Value}
+	index, _, isLeader := kv.rf.Start(newOp)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
 
 	// block on index
-	kv.waitIndexCommit(index)
+	op := kv.waitIndexCommit(index, args.CID, args.RID)
+
+	if op.WrongLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
 
 	reply.Err = OK
 }
@@ -182,7 +224,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.store = make(map[string]string)
-	kv.indexCh = make(map[int]chan int)
+	kv.indexCh = make(map[int]chan *Op)
+	kv.lastCommited = make(map[int64]int)
 	// You may need initialization code here.
 	go kv.apply()
 

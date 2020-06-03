@@ -9,6 +9,8 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	leader int
+	rid int
+	cid int64
 }
 
 func nrand() int64 {
@@ -22,6 +24,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.cid = nrand()
 	return ck
 }
 
@@ -41,6 +44,9 @@ func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
 	args := GetArgs{}
+	args.RID = ck.rid
+	ck.rid++
+	args.CID = ck.cid
 	args.Key = key
 	reply := GetReply{}
 	for {
@@ -71,6 +77,9 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	args := PutAppendArgs{}
+	args.RID = ck.rid
+	ck.rid++
+	args.CID = ck.cid
 	args.Key = key
 	args.Value = value
 	args.Op = op
