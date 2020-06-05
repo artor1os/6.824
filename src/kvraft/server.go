@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -11,7 +12,7 @@ import (
 	"../raft"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -57,24 +58,59 @@ type KVServer struct {
 	lastCommited map[int64]int
 }
 
+func (kv *KVServer) snapshot(index int) {
+	DPrintf("make snapshot")
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	_ = e.Encode(kv.store)
+	_ = e.Encode(kv.lastCommited)
+
+	data := w.Bytes()
+	go kv.rf.DiscardOldLog(index, data)
+}
+
+func (kv *KVServer) recover(snapshot []byte) {
+	DPrintf("recover from snapshot, size %v", len(snapshot))
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	var store map[string]string
+	var lastCommited map[int64]int
+
+	if d.Decode(&store) != nil || d.Decode(&lastCommited) != nil {
+		DPrintf("failed to read snapshot")
+	} else {
+		kv.store = store
+		kv.lastCommited = lastCommited
+	}
+}
+
 func (kv *KVServer) apply() {
 	for am := range kv.applyCh {
-		op := am.Command.(Op)
 		kv.mu.Lock()
-		var ch chan *Op
-		var ok bool
-		if ch, ok = kv.indexCh[am.CommandIndex]; ok {
-			select {
-			case <-ch:
-			default:
-			}
+		if !am.CommandValid { // snapshot
+			kv.recover(am.Snapshot)
 		} else {
-			ch = make(chan *Op, 1)
-			kv.indexCh[am.CommandIndex] = ch
+			op := am.Command.(Op)
+			var ch chan *Op
+			var ok bool
+			if ch, ok = kv.indexCh[am.CommandIndex]; ok {
+				select {
+				case <-ch:
+				default:
+				}
+			} else {
+				ch = make(chan *Op, 1)
+				kv.indexCh[am.CommandIndex] = ch
+			}
+			kv.applyOp(&op)
+			if kv.maxraftstate > -1 && am.RaftStateSize >= kv.maxraftstate {
+				kv.snapshot(am.CommandIndex)
+			}
+			ch <- &op
 		}
-		kv.applyOp(&op)
 		kv.mu.Unlock()
-		ch <- &op
 	}
 }
 
@@ -126,6 +162,7 @@ func (kv *KVServer) waitIndexCommit(index int, cid int64, rid int) *Op {
 		}
 		return op
 	case <-time.After(time.Millisecond * 300):
+		DPrintf("timeout")
 		return &Op{WrongLeader: true}
 	}
 }
