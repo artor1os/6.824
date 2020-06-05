@@ -53,18 +53,80 @@ type LogEntry struct {
 	Term    int
 }
 
-type Logs []*LogEntry
+type Logs struct {
+	Entries []*LogEntry
 
-func (log Logs) String() string {
+	Base int
+
+	LastIncludedIndex int
+	LastIncludedTerm int
+}
+
+func (log *Logs) String() string {
 	var sb strings.Builder
 	sb.WriteString("[")
-	for i, l := range log {
+	for i, l := range log.Entries {
 		if i != 0 {
 			sb.WriteString(", ")
 		}
 		sb.WriteString(strconv.Itoa(l.Term))
 	}
 	return sb.String()
+}
+
+func (log *Logs) adjust(index int) int {
+	index -= log.Base
+	index -= log.LastIncludedIndex
+	return index
+}
+
+func (log *Logs) At(index int) *LogEntry {
+	index = log.adjust(index)
+	if index == -1 {
+		return &LogEntry{Command: nil, Term: log.LastIncludedTerm}
+	}
+	return log.Entries[index]
+}
+
+
+func (log *Logs) Len() int {
+	return log.Base + log.LastIncludedIndex + len(log.Entries)
+}
+
+func (log *Logs) Back() *LogEntry {
+	return log.At(log.Len()-1)
+}
+
+func (log *Logs) Append(e ...*LogEntry) {
+	log.Entries = append(log.Entries, e...)
+}
+
+type truncateDirection int
+
+const (
+	front truncateDirection = iota
+	back
+)
+
+// Truncate truncates log after or before(dir is back or front) index (inclusively)
+func (log *Logs) Truncate(index int, dir truncateDirection) {
+	index = log.adjust(index)
+	if index < 0 {
+		index = 0
+	}
+	if dir == back {
+		log.Entries = log.Entries[:index]
+	} else if dir == front {
+		log.LastIncludedTerm = log.Entries[index].Term
+		log.LastIncludedIndex += index+1
+		log.Entries = log.Entries[index+1:]
+	}
+}
+
+// RangeFrom returns all LogEntry after index(inclusively)
+func (log *Logs) RangeFrom(index int) []*LogEntry {
+	index = log.adjust(index)
+	return log.Entries[index:]
 }
 
 //
@@ -88,7 +150,7 @@ type Raft struct {
 
 	// Lab2B: log replication
 	// Persistent state on all servers
-	log Logs // log entries; each entry contains command for state machine, and term when entry was received by leader(first index is 1)
+	log *Logs // log entries; each entry contains command for state machine, and term when entry was received by leader(first index is 1)
 
 	// Volatile state on all servers
 	commitIndex int // index of highest log entry known to be commited(initialized to 0, increases monotonically)
@@ -180,7 +242,7 @@ func (rf *Raft) readPersist(data []byte) {
 
 	var currentTerm int
 	var votedFor int
-	var log Logs
+	var log *Logs
 
 	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
 		//rf.say("readPersist: fail")
@@ -254,12 +316,12 @@ func (rf *Raft) isCandidateUptodate(lastLogIndex int, lastLogTerm int) bool {
 	// with the later term is more up-to-date. If the logs end with the same term, then whichever log is longer
 	// is more up-to-date
 	var ret bool
-	myLastLog := rf.log[len(rf.log)-1]
+	myLastLog := rf.log.Back()
 	if myLastLog.Term < lastLogTerm {
 		ret = true
 	}
 	if myLastLog.Term == lastLogTerm {
-		ret = len(rf.log)-1 <= lastLogIndex
+		ret = rf.log.Len()-1 <= lastLogIndex
 	}
 	if myLastLog.Term > lastLogTerm {
 		ret = false
@@ -359,7 +421,7 @@ type AppendEntriesArgs struct {
 	// 2B
 	PrevLogIndex int // index of log entry immediately preceding new ones
 	PrevLogTerm  int // term of prevLogIndex entry
-	Entries      Logs // log entries to store(empty for heartbeat; may send more than one for efficiency)
+	Entries      []*LogEntry // log entries to store(empty for heartbeat; may send more than one for efficiency)
 	LeaderCommit int // leader's commitIndex
 }
 
@@ -386,7 +448,7 @@ func (rf *Raft) apply() {
 		msg := ApplyMsg{}
 		msg.CommandValid = true
 		msg.CommandIndex = i
-		msg.Command = rf.log[i].Command
+		msg.Command = rf.log.At(i).Command
 		rf.applyCh <- msg
 	}
 	rf.lastApplied = rf.commitIndex
@@ -431,21 +493,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.mu.Lock()
 	}
 
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= rf.log.Len() || rf.log.At(args.PrevLogIndex).Term != args.PrevLogTerm {
 		// [raft-paper, AppendEntriesRPC receiver]
 		// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
 		//rf.say("AppendEntries: mismatch, prevLogIndex %v, prevLogTerm %v\nmy log %s", args.PrevLogIndex, args.PrevLogTerm, rf.log)
 		reply.Success = false
 
-		last := Min(args.PrevLogIndex, len(rf.log)-1)
-		term := rf.log[last].Term
+		last := Min(args.PrevLogIndex, rf.log.Len()-1)
+		term := rf.log.At(last).Term
 		reply.ConflictTerm = term
-		reply.LastIndex = len(rf.log) - 1
+		reply.LastIndex = rf.log.Len() - 1
 
 		if last == 0 {
 			reply.FirstConflictIndex = last
 		} else {
-			for ; last > 0 && rf.log[last].Term == term; last-- {
+			for ; last > 0 && rf.log.At(last).Term == term; last-- {
 			}
 			last++
 
@@ -458,7 +520,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.Entries != nil { // not a heartbeat
 		//rf.say("AppendEntries: entries %v", args.Entries)
-		l := len(rf.log)
+		l := rf.log.Len()
 		start := args.PrevLogIndex + 1
 		i := start
 		dirty := false
@@ -466,8 +528,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// [raft-paper, AppendEntriesRPC receiver]
 			// If an existing entry conflicts with a new one(same index but different term),
 			// delete the existing entry and all that follow it
-			if rf.log[i].Term != args.Entries[i-start].Term {
-				rf.log = rf.log[:i]
+			if rf.log.At(i).Term != args.Entries[i-start].Term {
+				rf.log.Truncate(i, back)
 				dirty = true
 				break
 			}
@@ -476,7 +538,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			dirty = true
 			// [raft-paper, AppendEntriesRPC receiver]
 			// Append any new entries not already in the log
-			rf.log = append(rf.log, args.Entries[i-start])
+			rf.log.Append(args.Entries[i-start])
 		}
 		if dirty {
 			rf.persist()
@@ -569,7 +631,7 @@ func (rf *Raft) updateMatchIndex(server int, index int) {
 	maxN := -1
 	for i := rf.majority() - 1; i >= 0; i-- {
 		n := mi[i]
-		if rf.log[n].Term == rf.currentTerm {
+		if rf.log.At(n).Term == rf.currentTerm {
 			maxN = n
 			break
 		}
@@ -598,10 +660,10 @@ func (rf *Raft) appendEntries(server int) {
 		args.Term = rf.currentTerm
 		args.LeaderCommit = rf.commitIndex
 		args.PrevLogIndex = rf.nextIndex[server] - 1
-		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+		args.PrevLogTerm = rf.log.At(args.PrevLogIndex).Term
 		// If last log index >= nextIndex, then args.Entries will not be nil
 		// Otherwise, args.Entries == nil, and AppendEnties will be a heartbeat
-		args.Entries = rf.log[rf.nextIndex[server]:]
+		args.Entries = rf.log.RangeFrom(rf.nextIndex[server])
 		reply := AppendEntriesReply{}
 		rf.mu.Unlock()
 
@@ -624,7 +686,7 @@ func (rf *Raft) appendEntries(server int) {
 				if index > reply.LastIndex {
 					index = reply.LastIndex
 				}
-				for ; index >= reply.FirstConflictIndex && rf.log[index].Term != reply.ConflictTerm; index-- {
+				for ; index >= reply.FirstConflictIndex && rf.log.At(index).Term != reply.ConflictTerm; index-- {
 				}
 
 				rf.nextIndex[server] = index + 1
@@ -707,8 +769,8 @@ func (rf *Raft) campaign() (elected chan struct{}) {
 		args := RequestVoteArgs{}
 		args.Term = rf.currentTerm
 		args.CandidateId = rf.me
-		args.LastLogIndex = len(rf.log) - 1
-		args.LastLogTerm = rf.log[args.LastLogIndex].Term
+		args.LastLogIndex = rf.log.Len() - 1
+		args.LastLogTerm = rf.log.At(args.LastLogIndex).Term
 		rf.mu.Unlock()
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
@@ -771,7 +833,7 @@ func (rf *Raft) wait() {
 
 			rf.nextIndex = make([]int, len(rf.peers))
 			for i := range rf.nextIndex {
-				rf.nextIndex[i] = len(rf.log)
+				rf.nextIndex[i] = rf.log.Len()
 			}
 			rf.matchIndex = make([]int, len(rf.peers))
 			for i := range rf.matchIndex {
@@ -816,13 +878,13 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 		return
 	}
 
-	index = len(rf.log)
+	index = rf.log.Len()
 	term = rf.currentTerm
 	isLeader = true
 	//rf.say("Start: index %v, term %v", index, term)
 	// [raft-paper]If command received from client: append entry to local log,
 	// respond after entry applied to state machine
-	rf.log = append(rf.log, &LogEntry{Command: command, Term: rf.currentTerm})
+	rf.log.Append(&LogEntry{Command: command, Term: rf.currentTerm})
 
 	rf.persist()
 
@@ -882,7 +944,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.resignCh = make(chan struct{})
 	rf.resetCh = make(chan struct{})
 
-	rf.log = Logs{&LogEntry{Command: "dummy", Term: -1}}
+	rf.log = &Logs{
+		Entries: nil,
+		Base: 1,
+		LastIncludedIndex: 0,
+		LastIncludedTerm: -1,
+	}
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
