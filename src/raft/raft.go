@@ -503,6 +503,50 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+type InstallSnapshotArgs struct {
+	Term int // leader's term
+	LeaderId int // so follower can redirect clients
+	LastIncludedIndex int // the snapshot replaces all entries up through and including this index
+	LastIncludedTerm int // term of lastIncludedIndex
+	Offset int // byte offset where chunk is posistioned in the snapshot file
+	Data []byte // raw bytes of the snapshot chunk, starting at offset
+	Done bool // true if this is the last chunk
+}
+
+type InstallSnapshotReply struct {
+	Term int // currentTerm, for leader to update itself
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.acceptNewerTerm(args.Term, args.LeaderId)
+	rf.mu.Lock()
+	reply.Term = rf.currentTerm
+	// [raft-paper, InstallSnapshot receiver]
+	// Reply immediately if term < currentTerm
+	if args.Term < rf.currentTerm {
+		rf.mu.Unlock()
+		return
+	}
+
+	// [raft-paper, InstallSnapshot receiver]
+	// Create new snapshot file if first chunk (offset is 0)
+	// Write data into snapshot file at given offset
+	// Reply and wait for more data chunks if done is false
+	// Save snapshot file, discard any existing or partial snapshot with a smaller index
+	// If existing log entry has same index and term as snapshot's last included entry, retain log entries following it and reply
+	// Discard the entire log
+	// Reset state machine using snapshot contents(and load snapshot's cluster configuration)
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	// lock should be unheld
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	if ok {
+		rf.acceptNewerTerm(reply.Term, server)
+	}
+	return ok
+}
+
 func (rf *Raft) majority() int {
 	return (len(rf.peers) + 1) / 2
 }
