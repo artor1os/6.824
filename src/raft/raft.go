@@ -799,27 +799,27 @@ func (rf *Raft) notify() {
 	ticker := time.NewTicker(heartbeatInterval)
 	for {
 		select {
-		case <-rf.notifyCh:
-		case <-ticker.C:
-			if rf.killed() {
-				return
-			}
-			rf.mu.Lock()
-			if rf.role == leader {
-				for i := 0; i < len(rf.peers); i++ {
-					if i == rf.me {
-						continue
-					}
-					rf.say("notify: to %v", i)
-					go rf.appendEntries(i)
-				}
-			}
-			rf.mu.Unlock()
 		case <-rf.resignCh:
 			rf.say("notify: resign")
 			go rf.wait()
 			return
+		case <-rf.notifyCh:
+		case <-ticker.C:
 		}
+		if rf.killed() {
+			return
+		}
+		rf.mu.Lock()
+		if rf.role == leader {
+			for i := 0; i < len(rf.peers); i++ {
+				if i == rf.me {
+					continue
+				}
+				rf.say("notify: to %v", i)
+				go rf.appendEntries(i)
+			}
+		}
+		rf.mu.Unlock()
 	}
 }
 
