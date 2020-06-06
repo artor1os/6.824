@@ -89,9 +89,13 @@ func (log *Logs) Include(index int) bool {
 }
 
 func (log *Logs) At(index int) *LogEntry {
+	origin := index
 	index = log.adjust(index)
 	if index == -1 {
 		return &LogEntry{Command: nil, Term: log.LastIncludedTerm}
+	}
+	if index < 0 || index >= len(log.Entries) {
+		panic(fmt.Sprintf("out of range, origin index %v, LastIncludedIndex %v, length %v", origin, log.LastIncludedIndex, len(log.Entries)))
 	}
 	return log.Entries[index]
 }
@@ -176,6 +180,8 @@ type Raft struct {
 	resetCh  chan struct{}
 	resignCh chan struct{}
 	notifyCh chan struct{}
+
+	applyCond *sync.Cond
 }
 
 type role string
@@ -317,7 +323,7 @@ func (rf *Raft) acceptNewerTerm(inTerm int, vote int) {
 	if isNolongerLeader {
 		rf.say("acceptNewerTerm: no longer leader, send resign to channel")
 		rf.resignCh <- struct{}{}
-		rf.say("not block")
+		rf.say("acceptNewerTerm: not block")
 	}
 }
 
@@ -383,7 +389,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// or granting vote to candidate: convert to candidate
 		rf.say("RequestVote: send reset to channel")
 		rf.resetCh <- struct{}{}
-		rf.say("not block")
+		rf.say("RequestVote: not block")
 	}
 }
 
@@ -448,32 +454,37 @@ type AppendEntriesReply struct {
 
 // apply goroutine
 func (rf *Raft) apply() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.killed() {
-		return
-	}
-	rf.say("apply: lastApplied %v, commitIndex %v", rf.lastApplied, rf.commitIndex)
 	// [raft-paper, all-servers]
 	// If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine
-	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+	for {
+		rf.mu.Lock()
+		if rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
+		for !(rf.commitIndex > rf.lastApplied) {
+			rf.applyCond.Wait()
+		}
+
+		rf.say("apply: lastApplied %v, commitIndex %v", rf.lastApplied, rf.commitIndex)
+		rf.lastApplied++
 		msg := ApplyMsg{}
 		msg.CommandValid = true
-		msg.CommandIndex = i
-		msg.Command = rf.log.At(i).Command
+		msg.CommandIndex = rf.lastApplied
+		msg.Command = rf.log.At(rf.lastApplied).Command
 		msg.RaftStateSize = rf.persister.RaftStateSize()
+		rf.mu.Unlock()
 		rf.say("apply: send msg %#v to channel", msg)
 		rf.applyCh <- msg
 		rf.say("apply: not block")
 	}
-	rf.lastApplied = rf.commitIndex
 }
 
 // lock should be held by caller
 func (rf *Raft) updateCommitIndex(index int) {
 	rf.say("updateCommitIndex: from %v to %v", rf.commitIndex, index)
 	rf.commitIndex = index
-	go rf.apply()
+	rf.applyCond.Signal()
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -504,11 +515,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.mu.Unlock()
 		rf.say("AppendEntries: send reset to channel")
 		rf.resetCh <- struct{}{}
-		rf.say("not block")
+		rf.say("AppendEntries: not block")
 		rf.mu.Lock()
 	}
 
-	if args.PrevLogIndex >= rf.log.Len() || rf.log.At(args.PrevLogIndex).Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= rf.log.Len() || (args.PrevLogIndex >= rf.log.LastIncludedIndex && rf.log.At(args.PrevLogIndex).Term != args.PrevLogTerm) {
 		// [raft-paper, AppendEntriesRPC receiver]
 		// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
 		rf.say("AppendEntries: mismatch, prevLogIndex %v, prevLogTerm %v", args.PrevLogIndex, args.PrevLogTerm)
@@ -532,10 +543,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.Entries != nil { // not a heartbeat
-		rf.say("AppendEntries: entries %v", args.Entries)
+		rf.say("AppendEntries: entries %#v", args.Entries)
 		l := rf.log.Len()
 		start := args.PrevLogIndex + 1
-		i := start
+		i := Max(start, rf.log.LastIncludedIndex+1)
 		dirty := false
 		for ; i < l && i-start < len(args.Entries); i++ {
 			// [raft-paper, AppendEntriesRPC receiver]
@@ -622,7 +633,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.mu.Unlock()
 		rf.say("InstallSnapshot: send reset to channel")
 		rf.resetCh <- struct{}{}
-		rf.say("not block")
+		rf.say("InstallSnapshot: not block")
 		rf.mu.Lock()
 	}
 
@@ -636,24 +647,28 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	// If existing log entry has same index and term as snapshot's last included entry, retain log entries following it and reply
 	if rf.log.Include(args.LastIncludedIndex) && rf.log.At(args.LastIncludedIndex).Term == args.LastIncludedTerm {
+		rf.say("InstallSnapshot: log include LastIncludedIndex %v, retain log after it", args.LastIncludedIndex)
 		rf.log.Truncate(args.LastIncludedIndex, front)
-		rf.persist(args.Data)
-		return
-	}
+	} else {
 	// Discard the entire log
 	// Reset state machine using snapshot contents(and load snapshot's cluster configuration)
-	rf.log.Entries = nil
+		rf.say("InstallSnapshot: discard entire log")
+		rf.log.Entries = nil
+		rf.applySnapshot(args.Data)
+	}
 	rf.log.LastIncludedIndex = args.LastIncludedIndex
 	rf.log.LastIncludedTerm = args.LastIncludedTerm
 	rf.persist(args.Data)
 	rf.commitIndex = args.LastIncludedIndex
 	rf.lastApplied = args.LastIncludedIndex
-	rf.applySnapshot(args.Data)
+	rf.say("InstallSnapshot: complete, lastApplied %v, commitIndex %v, LastIncludedIndex %v", rf.lastApplied, rf.commitIndex, args.LastIncludedIndex)
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
 	// lock should be unheld
+	rf.say("InstallSnapshot RPC: to %v", server)
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	rf.say("InstallSnapshot RPC: to %v, not block", server)
 	if ok {
 		rf.acceptNewerTerm(reply.Term, server)
 	}
@@ -668,20 +683,34 @@ func (rf *Raft) majority() int {
 func (rf *Raft) updateMatchIndex(server int, index int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.killed() || rf.matchIndex[server] >= index {
+	if rf.killed() || rf.role != leader || rf.matchIndex[server] >= index {
 		return
 	}
 	rf.say("updateMatchIndex: of server %v, from %v to %v", server, rf.matchIndex[server], index)
 	rf.matchIndex[server] = index
 
-	// [raft-paper]If there exists an N such that N > commitIndex, a majority of matchIndex[i] >= N, 
+	// [raft-paper, Leader]
+	// If there exists an N such that N > commitIndex, a majority of matchIndex[i] >= N, 
 	// and log[N].term == currentTerm: set commitIndex = N
+
+	// Implementation:
+	// 1. Copy and sort matchIndex in ascending order
+	// 2. So all values in sorted matchIndex before index majority-1(inclusively) meet the requirement "a majority of matchIndex[i] >= N"
+	// 3. Count from majority-1 to 0, find the largest N that subject to "log[N].term == currentTerm"
+	// 4. Finally test if the largest N greater than commitIndex
+	//
+	// Notes for Log compaction:
+	// If N in step 3 <= rf.log.LastIncludedIndex, there is no need to continue
+	// Because commitIndex > LastIncludedIndex, break immediately to avoid out of range indexing
 	mi := make([]int, len(rf.matchIndex))
 	copy(mi, rf.matchIndex)
 	sort.Ints(mi)
 	maxN := -1
 	for i := rf.majority() - 1; i >= 0; i-- {
 		n := mi[i]
+		if n <= rf.log.LastIncludedIndex {
+			break
+		}
 		if rf.log.At(n).Term == rf.currentTerm {
 			maxN = n
 			break
@@ -783,7 +812,7 @@ func (rf *Raft) appendEntries(server int) {
 				continue
 			}
 		} else {
-			rf.say("appendEntries: bad rpc to %v", server)
+			rf.say("appendEntries: bad rpc to %v, ok %v, args.Term %v, currentTerm %v", server, ok, args.Term, rf.currentTerm)
 		}
 		rf.mu.Unlock()
 		return
@@ -799,6 +828,9 @@ func (rf *Raft) notify() {
 	ticker := time.NewTicker(heartbeatInterval)
 	for {
 		select {
+		case <-rf.resetCh:
+			rf.say("notify: stale reset")
+			continue
 		case <-rf.resignCh:
 			rf.say("notify: resign")
 			go rf.wait()
@@ -888,6 +920,12 @@ func (rf *Raft) wait() {
 		eTimeout := time.Duration(RandIntRange(eTimeoutLeft, eTimeoutRight)) * time.Millisecond
 		timer := time.NewTimer(eTimeout)
 		select {
+		case <-rf.notifyCh:
+			rf.say("wait: stale notify")
+			continue
+		case <-rf.resignCh:
+			rf.say("wait: stale resign")
+			continue
 		case <-timer.C:
 			rf.mu.Lock()
 			if rf.killed() || rf.role == leader {
@@ -932,7 +970,7 @@ func (rf *Raft) wait() {
 			rf.mu.Unlock()
 			rf.say("wait: trigger initial heartbeat")
 			rf.notifyCh <- struct{}{}
-			rf.say("not block")
+			rf.say("wait: not block")
 			return
 		}
 	}
@@ -980,6 +1018,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	rf.mu.Unlock()
 
 	rf.notifyCh <- struct{}{}
+	rf.say("Start: not block")
 
 	return index, term, isLeader
 }
@@ -988,12 +1027,16 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 // index must >= commitIndex, usually it should <= lastApplied <= commitIndex
 func (rf *Raft) DiscardOldLog(index int, snapshot []byte) {
 	rf.mu.Lock()
-	rf.log.Truncate(index-1, front)
-	rf.persist(snapshot)
-	rf.mu.Unlock()
-
+	rf.say("DiscardOldLog: index %v, lastApplied %v, commitIndex %v, LastIncludedIndex %v", index, rf.lastApplied, rf.commitIndex, rf.log.LastIncludedIndex)
+	if index > rf.log.LastIncludedIndex {
+		rf.log.Truncate(index-1, front)
+		rf.persist(snapshot)
+	} else {
+		rf.say("DiscardOldLog: stale")
+	}
 	// trigger installSnapshot
-	rf.notifyCh <- struct{}{}
+	rf.mu.Unlock()
+	rf.say("DiscardOldLog: complete")
 }
 
 //
@@ -1010,9 +1053,6 @@ func (rf *Raft) DiscardOldLog(index int, snapshot []byte) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	rf.mu.Lock()
-	close(rf.applyCh)
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) killed() bool {
@@ -1052,8 +1092,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		LastIncludedIndex: 0,
 		LastIncludedTerm: -1,
 	}
-	rf.commitIndex = 0
-	rf.lastApplied = 0
 
 	rf.notifyCh = make(chan struct{})
 
@@ -1061,11 +1099,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.commitIndex = rf.log.LastIncludedIndex
+	rf.lastApplied = rf.log.LastIncludedIndex
 	if persister.SnapshotSize() > 0 {
 		rf.applySnapshot(persister.ReadSnapshot())
 	}
 
+	rf.applyCond = sync.NewCond(&rf.mu)
 	go rf.wait()
+	go rf.apply()
 
 	return rf
 }

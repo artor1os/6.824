@@ -12,7 +12,7 @@ import (
 	"../raft"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -258,7 +258,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 1)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.store = make(map[string]string)
 	kv.indexCh = make(map[int]chan *Op)

@@ -1,11 +1,14 @@
 package raft
 
-import "log"
-import "math/rand"
-import "time"
+import (
+	"log"
+	"os"
+	"math/rand"
+	"time"
+)
 
 // Debugging
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -21,6 +24,8 @@ func DPrintln(a ...interface{}) {
 }
 
 func init() {
+	f, _ := os.Create("log.log")
+	log.SetOutput(f)
 	rand.Seed(time.Now().UnixNano())
 }
 
@@ -30,6 +35,13 @@ func RandIntRange(left int, right int) int {
 
 func Min(a, b int) int {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func Max(a, b int) int {
+	if a > b {
 		return a
 	}
 	return b
