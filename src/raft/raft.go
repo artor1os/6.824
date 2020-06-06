@@ -473,10 +473,10 @@ func (rf *Raft) apply() {
 		msg.CommandIndex = rf.lastApplied
 		msg.Command = rf.log.At(rf.lastApplied).Command
 		msg.RaftStateSize = rf.persister.RaftStateSize()
-		rf.mu.Unlock()
 		rf.say("apply: send msg %#v to channel", msg)
 		rf.applyCh <- msg
 		rf.say("apply: not block")
+		rf.mu.Unlock()
 	}
 }
 
@@ -646,29 +646,36 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// In this lab, no partition, simply save snapshot
 
 	// If existing log entry has same index and term as snapshot's last included entry, retain log entries following it and reply
+	rf.say("InstallSnapshot: LastIncludedIndex %v, my LastIncludedIndex %v, commitIndex %v, lastApplied %v", args.LastIncludedIndex, rf.log.LastIncludedIndex, rf.commitIndex, rf.lastApplied)
+	if args.LastIncludedIndex <= rf.log.LastIncludedIndex {
+		return
+	}
 	if rf.log.Include(args.LastIncludedIndex) && rf.log.At(args.LastIncludedIndex).Term == args.LastIncludedTerm {
 		rf.say("InstallSnapshot: log include LastIncludedIndex %v, retain log after it", args.LastIncludedIndex)
 		rf.log.Truncate(args.LastIncludedIndex, front)
+		if args.LastIncludedIndex > rf.lastApplied {
+			rf.applySnapshot(args.Data)
+		}
+		rf.commitIndex = Max(args.LastIncludedIndex, rf.commitIndex)
+		rf.lastApplied = Max(args.LastIncludedIndex, rf.lastApplied)
 	} else {
 	// Discard the entire log
 	// Reset state machine using snapshot contents(and load snapshot's cluster configuration)
 		rf.say("InstallSnapshot: discard entire log")
 		rf.log.Entries = nil
+		rf.commitIndex = args.LastIncludedIndex
+		rf.lastApplied = args.LastIncludedIndex
+		rf.log.LastIncludedIndex = args.LastIncludedIndex
+		rf.log.LastIncludedTerm = args.LastIncludedTerm
 		rf.applySnapshot(args.Data)
 	}
-	rf.log.LastIncludedIndex = args.LastIncludedIndex
-	rf.log.LastIncludedTerm = args.LastIncludedTerm
 	rf.persist(args.Data)
-	rf.commitIndex = args.LastIncludedIndex
-	rf.lastApplied = args.LastIncludedIndex
 	rf.say("InstallSnapshot: complete, lastApplied %v, commitIndex %v, LastIncludedIndex %v", rf.lastApplied, rf.commitIndex, args.LastIncludedIndex)
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
 	// lock should be unheld
-	rf.say("InstallSnapshot RPC: to %v", server)
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
-	rf.say("InstallSnapshot RPC: to %v, not block", server)
 	if ok {
 		rf.acceptNewerTerm(reply.Term, server)
 	}
@@ -741,7 +748,7 @@ func (rf *Raft) installSnapshot(server int) bool {
 		rf.mu.Unlock()
 		return false
 	}
-	rf.nextIndex[server] = rf.log.LastIncludedIndex + 1
+	rf.nextIndex[server] = args.LastIncludedIndex + 1
 	rf.say("installSnapshot: installSnapshot to %v success, set next to %v", server, rf.nextIndex[server])
 	rf.mu.Unlock()
 	return true
@@ -1034,7 +1041,6 @@ func (rf *Raft) DiscardOldLog(index int, snapshot []byte) {
 	} else {
 		rf.say("DiscardOldLog: stale")
 	}
-	// trigger installSnapshot
 	rf.mu.Unlock()
 	rf.say("DiscardOldLog: complete")
 }
