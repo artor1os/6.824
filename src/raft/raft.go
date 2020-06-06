@@ -936,6 +936,7 @@ func (rf *Raft) wait() {
 		case <-timer.C:
 			rf.mu.Lock()
 			if rf.killed() || rf.role == leader {
+				rf.mu.Unlock()
 				return
 			}
 			if rf.role == follower {
