@@ -1,8 +1,12 @@
 package kvraft
 
-import "../labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"time"
+
+	"../labrpc"
+)
 
 
 type Clerk struct {
@@ -48,8 +52,9 @@ func (ck *Clerk) Get(key string) string {
 	ck.rid++
 	args.CID = ck.cid
 	args.Key = key
-	reply := GetReply{}
+	i := 0
 	for {
+		reply := GetReply{}
 		ok := ck.servers[ck.leader].Call("KVServer.Get", &args, &reply)
 		if ok {
 			if reply.Err == OK {
@@ -59,8 +64,12 @@ func (ck *Clerk) Get(key string) string {
 				return ""
 			}
 		}
-		ck.leader += 1
-		ck.leader = ck.leader % len(ck.servers)
+		ck.leader++
+		ck.leader %= len(ck.servers)
+		i++
+		if i % len(ck.servers) == 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 }
 
@@ -83,14 +92,19 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Key = key
 	args.Value = value
 	args.Op = op
-	reply := PutAppendReply{}
+	i := 0
 	for {
+		reply := PutAppendReply{}
 		ok := ck.servers[ck.leader].Call("KVServer.PutAppend", &args, &reply)
 		if ok && reply.Err == OK {
 			return
 		}
-		ck.leader += 1
-		ck.leader = ck.leader % len(ck.servers)
+		ck.leader++
+		ck.leader %= len(ck.servers)
+		i++
+		if i % len(ck.servers) == 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 }
 
