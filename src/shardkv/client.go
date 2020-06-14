@@ -40,6 +40,8 @@ type Clerk struct {
 	config   shardmaster.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	rid int
+	cid int64
 }
 
 //
@@ -56,6 +58,7 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardmaster.MakeClerk(masters)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.cid = nrand()
 	return ck
 }
 
@@ -67,6 +70,9 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 //
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
+	args.CID = ck.cid
+	args.RID = ck.rid
+	ck.rid++
 	args.Key = key
 
 	for {
@@ -101,6 +107,9 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args := PutAppendArgs{}
+	args.CID = ck.cid
+	args.RID = ck.rid
+	ck.rid++
 	args.Key = key
 	args.Value = value
 	args.Op = op
