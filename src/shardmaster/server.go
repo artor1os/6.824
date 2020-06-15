@@ -45,6 +45,8 @@ type Op struct {
 	Leave *LeaveInfo
 	Move *MoveInfo
 	Query *QueryInfo
+
+	QueryResult *QueryResult
 }
 
 type JoinInfo struct {
@@ -62,6 +64,9 @@ type MoveInfo struct {
 
 type QueryInfo struct {
 	Num int
+}
+
+type QueryResult struct {
 	Config Config
 }
 
@@ -220,7 +225,7 @@ func (sm *ShardMaster) applyOp(op *Op) {
 		if op.Query.Num < 0 || op.Query.Num >= len(sm.configs) {
 			index = len(sm.configs) - 1
 		}
-		op.Query.Config = sm.configs[index]
+		op.QueryResult = &QueryResult{Config: sm.configs[index]}
 	}
 	if !sm.isDup(op) {
 		sm.lastCommited[op.CID] = op.RID
@@ -288,7 +293,7 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 
 	reply.WrongLeader = op.WrongLeader
 	if !reply.WrongLeader {
-		reply.Config = op.Query.Config
+		reply.Config = op.QueryResult.Config
 	}
 }
 
