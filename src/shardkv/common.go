@@ -50,6 +50,7 @@ type GetReply struct {
 type MigrateArgs struct {
 	Shard int
 	Data map[string]string
+	Num int
 }
 
 type MigrateReply struct {

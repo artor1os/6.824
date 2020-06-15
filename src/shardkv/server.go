@@ -43,6 +43,7 @@ type Op struct {
 	Value string
 	Data map[string]string
 	Shard int
+	ConfigNum int
 
 	RID int
 	CID int64
@@ -77,6 +78,7 @@ type ShardKV struct {
 
 	configNum int
 	servedShards set
+	migratingShards set
 	waitingShards set
 }
 
@@ -127,14 +129,13 @@ const pollInterval = time.Millisecond * 100
 func (kv *ShardKV) pollConfig() {
 	ticker := time.NewTicker(pollInterval)
 	for range ticker.C {
-		config := kv.mck.Query(-1)
-		_, isLeader := kv.rf.GetState()
+		config := kv.mck.Query(kv.configNum+1)
 		kv.mu.Lock()
 		var wg sync.WaitGroup
 		if kv.waitingShards.Empty() && config.Num > kv.configNum {
-			kv.say("pollConfig: new config found, config %v", config)
+			kv.say("pollConfig: new config found, config %v, served %v", config, kv.servedShards)
 			if kv.configNum > 0 {
-				kv.migrate(config, isLeader, &wg)
+				kv.migrate(config, &wg)
 				kv.updateWaiting(config)
 			}
 			kv.configNum = config.Num
@@ -176,12 +177,12 @@ func (kv *ShardKV) dataOfShard(shard int) map[string]string {
 	return data
 }
 
-func (kv *ShardKV) migrate(newConf shardmaster.Config, isLeader bool, wg *sync.WaitGroup) {
+func (kv *ShardKV) migrate(newConf shardmaster.Config, wg *sync.WaitGroup) {
 	for shard := 0; shard < shardmaster.NShards; shard++ {
 		newGroup := newConf.Shards[shard]
-		if kv.servedShards.Contain(shard) && newGroup != kv.gid && isLeader {
+		if kv.servedShards.Contain(shard) && newGroup != kv.gid {
 			servers := newConf.Groups[newGroup]
-			args := MigrateArgs{Shard: shard, Data: kv.dataOfShard(shard)}
+			args := MigrateArgs{Shard: shard, Data: kv.dataOfShard(shard), Num: newConf.Num}
 			kv.say("migrate: shard %v, from %v, to %v", shard, kv.gid, newGroup)
 			wg.Add(1)
 			go func(s int) {
@@ -209,7 +210,7 @@ func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
 	for k, v := range args.Data {
 		data[k] = v
 	}
-	index, _, isLeader := kv.rf.Start(Op{Type: MigrateOp, Data: data, Shard: args.Shard})
+	index, _, isLeader := kv.rf.Start(Op{Type: MigrateOp, Data: data, Shard: args.Shard, ConfigNum: args.Num})
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
@@ -292,6 +293,10 @@ func (kv *ShardKV) applyOp(op *Op) {
 
 	if op.Type == MigrateOp {
 		kv.say("applyOp: MigrateOp, shard %v", op.Shard)
+		if op.ConfigNum < kv.configNum || (kv.servedShards.Contain(op.Shard) && !kv.waitingShards.Contain(op.Shard)) {
+			kv.say("applyOp: MigrateOp, duplicate")
+			return
+		}
 		for k, v := range op.Data {
 			kv.store[k] = v
 		}
@@ -459,6 +464,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// Use something like this to talk to the shardmaster:
 	kv.mck = shardmaster.MakeClerk(kv.masters)
 	kv.servedShards = newSet()
+	kv.migratingShards = newSet()
 	kv.waitingShards = newSet()
 	config := kv.mck.Query(-1)
 	kv.configNum = config.Num
