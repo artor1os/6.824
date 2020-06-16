@@ -1,12 +1,11 @@
 package shardkv
 
-
 // import "../shardmaster"
 import (
-	"os"
 	"bytes"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -38,25 +37,35 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Type string
-	Key string
+	Type  string
+	Key   string
 	Value string
-	Data map[string]string
-	Shard int
-	ConfigNum int
 
 	RID int
 	CID int64
 
-	Err Err
+	Err     Err
+	Migrate *MigrateInfo
+	Config  *ConfigInfo
 }
 
 const (
-	GetOp = "Get"
-	PutOp = "Put"
-	AppendOp = "Append"
+	GetOp     = "Get"
+	PutOp     = "Put"
+	AppendOp  = "Append"
 	MigrateOp = "Migrate"
+	ConfigOp  = "Config"
 )
+
+type MigrateInfo struct {
+	Data  map[string]string
+	Shard int
+	Num   int
+}
+
+type ConfigInfo struct {
+	Config *shardmaster.Config
+}
 
 type ShardKV struct {
 	mu           sync.Mutex
@@ -71,15 +80,79 @@ type ShardKV struct {
 	// Your definitions here.
 	store map[string]string
 
-	indexCh map[int]chan *Op
+	indexCh      map[int]chan *Op
 	lastCommited map[int64]int
 
 	mck *shardmaster.Clerk
 
-	configNum int
-	servedShards set
-	migratingShards set
-	waitingShards set
+	sm *shardManager
+}
+
+type shardManager struct {
+	GID             int
+	ConfigNum       int
+	ServedShards    set
+	WaitingShards   set
+	MigratingShards set
+	Config *shardmaster.Config
+}
+
+func newShardManager(gid int) *shardManager {
+	sm := &shardManager{GID: gid, ServedShards: newSet(), WaitingShards: newSet(), MigratingShards: newSet()}
+	return sm
+}
+
+func (sm *shardManager) Update(config *shardmaster.Config) {
+	if sm.ConfigNum > 0 {
+		sm.updateWaiting(config.Shards)
+		sm.updateMigrating(config.Shards)
+	}
+	sm.updateServed(config.Shards)
+	sm.ConfigNum = config.Num
+	sm.Config = config
+}
+
+func (sm *shardManager) Migrating() bool {
+	return !sm.WaitingShards.Empty() || !sm.MigratingShards.Empty()
+}
+
+func (sm *shardManager) ShouldServe(shard int) bool {
+	return sm.ServedShards.Contain(shard) && !sm.WaitingShards.Contain(shard)
+}
+
+func (sm *shardManager) Serve(shard int) {
+	sm.ServedShards.Add(shard)
+	sm.WaitingShards.Delete(shard)
+}
+
+func (sm *shardManager) Migrate(shard int) {
+	sm.MigratingShards.Delete(shard)
+}
+
+func (sm *shardManager) updateServed(shards [shardmaster.NShards]int) {
+	for shard := 0; shard < shardmaster.NShards; shard++ {
+		if shards[shard] != sm.GID {
+			sm.ServedShards.Delete(shard)
+		} else {
+			sm.ServedShards.Add(shard)
+		}
+	}
+}
+
+func (sm *shardManager) updateWaiting(shards [shardmaster.NShards]int) {
+	for shard := 0; shard < shardmaster.NShards; shard++ {
+		if !sm.ServedShards.Contain(shard) && shards[shard] == sm.GID {
+			sm.WaitingShards.Add(shard)
+		}
+	}
+}
+
+func (sm *shardManager) updateMigrating(shards [shardmaster.NShards]int) {
+	for shard := 0; shard < shardmaster.NShards; shard++ {
+		if sm.ServedShards.Contain(shard) && shards[shard] != sm.GID {
+			sm.MigratingShards.Add(shard)
+		}
+	}
 }
 
 type set map[int]bool
@@ -121,7 +194,7 @@ func newSet() set {
 
 func (kv *ShardKV) shouldServe(key string) bool {
 	shard := key2shard(key)
-	return kv.servedShards.Contain(shard) && !kv.waitingShards.Contain(shard)
+	return kv.sm.ShouldServe(shard)
 }
 
 const pollInterval = time.Millisecond * 100
@@ -129,43 +202,13 @@ const pollInterval = time.Millisecond * 100
 func (kv *ShardKV) pollConfig() {
 	ticker := time.NewTicker(pollInterval)
 	for range ticker.C {
-		config := kv.mck.Query(kv.configNum+1)
-		kv.mu.Lock()
-		var wg sync.WaitGroup
-		if kv.waitingShards.Empty() && config.Num > kv.configNum {
-			kv.say("pollConfig: new config found, config %v, served %v", config, kv.servedShards)
-			if kv.configNum > 0 {
-				kv.migrate(config, &wg)
-				kv.updateWaiting(config)
-			}
-			kv.configNum = config.Num
-			kv.updateServed(config)
-			kv.say("pollConfig: after, served %v", kv.servedShards)
-		}
-		kv.mu.Unlock()
-		wg.Wait()
-	}
-}
-
-func (kv *ShardKV) updateServed(config shardmaster.Config) {
-	for shard := 0; shard < shardmaster.NShards; shard++ {
-		if config.Shards[shard] != kv.gid {
-			kv.servedShards.Delete(shard)
-		} else {
-			kv.servedShards.Add(shard)
+		config := kv.mck.Query(kv.sm.ConfigNum+1)
+		if !kv.sm.Migrating() && config.Num > kv.sm.ConfigNum {
+			kv.rf.Start(Op{Type: ConfigOp, Config: &ConfigInfo{Config: &config}})
 		}
 	}
 }
 
-func (kv *ShardKV) updateWaiting(config shardmaster.Config) {
-	for shard := 0; shard < shardmaster.NShards; shard++ {
-		newGroup := config.Shards[shard]
-		if !kv.servedShards.Contain(shard) && newGroup == kv.gid {
-			kv.say("updateWaiting: group %v wait for new shard %v", kv.gid, shard)
-			kv.waitingShards.Add(shard)
-		}
-	}
-}
 
 func (kv *ShardKV) dataOfShard(shard int) map[string]string {
 	data := make(map[string]string)
@@ -177,40 +220,48 @@ func (kv *ShardKV) dataOfShard(shard int) map[string]string {
 	return data
 }
 
-func (kv *ShardKV) migrate(newConf shardmaster.Config, wg *sync.WaitGroup) {
-	for shard := 0; shard < shardmaster.NShards; shard++ {
-		newGroup := newConf.Shards[shard]
-		if kv.servedShards.Contain(shard) && newGroup != kv.gid {
-			servers := newConf.Groups[newGroup]
-			args := MigrateArgs{Shard: shard, Data: kv.dataOfShard(shard), Num: newConf.Num}
-			kv.say("migrate: shard %v, from %v, to %v", shard, kv.gid, newGroup)
-			wg.Add(1)
-			go func(s int) {
-				si := 0
-				for {
-					reply := MigrateReply{}
-					server := kv.make_end(servers[si])
-					ok := server.Call("ShardKV.Migrate", &args, &reply)
-					if ok && reply.Err == OK {
-						break
-					}
-					kv.say("migrate: send Migrate to %v failed, Err %v, shard %v", servers[si], reply.Err, s)
-					si++
-					si %= len(servers)
+func (kv *ShardKV) migrate() {
+	for shard := range kv.sm.MigratingShards {
+		newGroup := kv.sm.Config.Shards[shard]
+		servers := kv.sm.Config.Groups[newGroup]
+		args := MigrateArgs{Shard: shard, Data: kv.dataOfShard(shard), Num: kv.sm.ConfigNum}
+		kv.say("migrate: shard %v, from %v, to %v", shard, kv.gid, newGroup)
+		go func(s int) {
+			si := 0
+			for {
+				reply := MigrateReply{}
+				server := kv.make_end(servers[si])
+				ok := server.Call("ShardKV.Migrate", &args, &reply)
+				if ok && reply.Err == OK {
+					break
 				}
-				kv.say("migrate: shard %v, from %v, to %v, success", s, kv.gid, newGroup)
-				wg.Done()
-			}(shard)
-		}
+				kv.say("migrate: send Migrate to %v failed, shard %v, Num %v", servers[si], s, kv.sm.ConfigNum)
+				si++
+				si %= len(servers)
+			}
+			kv.say("migrate: shard %v, from %v, to %v, success", s, kv.gid, newGroup)
+			kv.mu.Lock()
+			kv.sm.Migrate(s)
+			kv.mu.Unlock()
+		}(shard)
 	}
 }
 
 func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
+	kv.mu.Lock()
+	if args.Num > kv.sm.ConfigNum + 1 {
+		reply.Err = ErrWrongLeader
+		kv.say("Migrate: too advanced migration, Shard %v, Num %v", args.Shard, args.Num)
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
 	data := make(map[string]string)
 	for k, v := range args.Data {
 		data[k] = v
 	}
-	index, _, isLeader := kv.rf.Start(Op{Type: MigrateOp, Data: data, Shard: args.Shard, ConfigNum: args.Num})
+	index, _, isLeader := kv.rf.Start(Op{Type: MigrateOp, Migrate: &MigrateInfo{Data: data, Shard: args.Shard, Num: args.Num}})
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
@@ -218,9 +269,8 @@ func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
 	kv.say("Migrate: start migration shard %v, group %v", args.Shard, kv.gid)
 
 	op := kv.waitIndexCommit(index, 0, 0)
-	
+
 	reply.Err = op.Err
-	kv.say("Migrate: migration Err %v", reply.Err)
 }
 
 func (kv *ShardKV) snapshot(index int) {
@@ -229,6 +279,7 @@ func (kv *ShardKV) snapshot(index int) {
 
 	_ = e.Encode(kv.store)
 	_ = e.Encode(kv.lastCommited)
+	_ = e.Encode(kv.sm)
 
 	data := w.Bytes()
 	go kv.rf.DiscardOldLog(index, data)
@@ -240,11 +291,14 @@ func (kv *ShardKV) recover(snapshot []byte) {
 
 	var store map[string]string
 	var lastCommited map[int64]int
+	var sm *shardManager
 
-	if d.Decode(&store) != nil || d.Decode(&lastCommited) != nil {
+	if d.Decode(&store) != nil || d.Decode(&lastCommited) != nil || d.Decode(&sm) != nil {
 	} else {
 		kv.store = store
 		kv.lastCommited = lastCommited
+		kv.sm = sm
+		kv.migrate()
 	}
 }
 
@@ -291,23 +345,38 @@ func (kv *ShardKV) commit(op *Op) {
 func (kv *ShardKV) applyOp(op *Op) {
 	op.Err = OK
 
-	if op.Type == MigrateOp {
-		kv.say("applyOp: MigrateOp, shard %v", op.Shard)
-		if op.ConfigNum < kv.configNum || (kv.servedShards.Contain(op.Shard) && !kv.waitingShards.Contain(op.Shard)) {
-			kv.say("applyOp: MigrateOp, duplicate")
+	if op.Type == ConfigOp {
+		if kv.sm.Migrating() {
+			kv.say("applyOp: ConfigOp, migrating, drop %#v", op.Config.Config)
 			return
 		}
-		for k, v := range op.Data {
+		if op.Config.Config.Num <= kv.sm.ConfigNum {
+			kv.say("applyOp: ConfigOp, stale, %#v", op.Config.Config)
+			return
+		}
+		kv.say("applyOp: ConfigOp, %#v", op.Config.Config)
+		kv.sm.Update(op.Config.Config)
+		kv.migrate()
+		kv.say("applyOp: ConfigOp, after, %#v", kv.sm)
+		return
+	}
+
+	if op.Type == MigrateOp {
+		if op.Migrate.Num < kv.sm.ConfigNum || kv.sm.ShouldServe(op.Migrate.Shard) {
+			kv.say("applyOp: MigrateOp, duplicate, shard %v, Num %v", op.Migrate.Shard, op.Migrate.Num)
+			return
+		}
+		kv.say("applyOp: MigrateOp, shard %v, Num %v", op.Migrate.Shard, op.Migrate.Num)
+		for k, v := range op.Migrate.Data {
 			kv.store[k] = v
 		}
-		kv.servedShards.Add(op.Shard)
-		kv.waitingShards.Delete(op.Shard)
+		kv.sm.Serve(op.Migrate.Shard)
 
 		return
 	}
 
 	if !kv.shouldServe(op.Key) {
-		kv.say("applyOp: key is migrating, not apply this op %#v", op)
+		kv.say("applyOp: key is migrating, shard %v, not apply this op %#v", key2shard(op.Key), op)
 		op.Err = ErrWrongGroup
 		return
 	}
@@ -358,7 +427,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	kv.mu.Lock()
 	if !kv.shouldServe(args.Key) {
-		kv.say("Get: reject key %v, served %#v, waiting %#v", args.Key, kv.servedShards, kv.waitingShards)
+		kv.say("Get: reject key %v, shard %v, %#v", args.Key, key2shard(args.Key), kv.sm)
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
 		if _, isLeader := kv.rf.GetState(); !isLeader {
@@ -376,6 +445,9 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 	// block on index
 	op := kv.waitIndexCommit(index, args.CID, args.RID)
+	if op.Err == OK {
+		kv.say("Get: OK, key %v", args.Key)
+	}
 
 	reply.Err = op.Err
 	reply.Value = op.Value
@@ -385,7 +457,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.mu.Lock()
 	if !kv.shouldServe(args.Key) {
-		kv.say("PutAppend: reject key %v, served %#v, waiting %#v", args.Key, kv.servedShards, kv.waitingShards)
+		kv.say("PutAppend: reject key %v, shard %v, %#v", args.Key, key2shard(args.Key), kv.sm)
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
 		if _, isLeader := kv.rf.GetState(); !isLeader {
@@ -417,7 +489,6 @@ func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
 }
-
 
 //
 // servers[] contains the ports of the servers in this group.
@@ -463,16 +534,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	// Use something like this to talk to the shardmaster:
 	kv.mck = shardmaster.MakeClerk(kv.masters)
-	kv.servedShards = newSet()
-	kv.migratingShards = newSet()
-	kv.waitingShards = newSet()
-	config := kv.mck.Query(-1)
-	kv.configNum = config.Num
-	kv.updateServed(config)
-	if config.Num > 1 {
-		kv.updateWaiting(config)
-	}
-
+	kv.sm = newShardManager(kv.gid)
 
 	kv.applyCh = make(chan raft.ApplyMsg, 1)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -482,6 +544,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	go kv.apply()
 	go kv.pollConfig()
+
+	kv.say("START")
 
 	return kv
 }
