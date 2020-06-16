@@ -51,6 +51,7 @@ type MigrateArgs struct {
 	Shard int
 	Data map[string]string
 	Num int
+	LastCommited map[int64]int
 }
 
 type MigrateReply struct {

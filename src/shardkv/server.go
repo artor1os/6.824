@@ -61,6 +61,7 @@ type MigrateInfo struct {
 	Data  map[string]string
 	Shard int
 	Num   int
+	LastCommited map[int64]int
 }
 
 type ConfigInfo struct {
@@ -114,6 +115,10 @@ func (sm *shardManager) Update(config *shardmaster.Config) {
 
 func (sm *shardManager) Migrating() bool {
 	return !sm.WaitingShards.Empty() || !sm.MigratingShards.Empty()
+}
+
+func (sm *shardManager) Waiting() bool {
+	return !sm.WaitingShards.Empty()
 }
 
 func (sm *shardManager) ShouldServe(shard int) bool {
@@ -220,11 +225,19 @@ func (kv *ShardKV) dataOfShard(shard int) map[string]string {
 	return data
 }
 
+func (kv *ShardKV) copyLastCommited() map[int64]int {
+	r := make(map[int64]int)
+	for k, v := range kv.lastCommited {
+		r[k] = v
+	}
+	return r
+}
+
 func (kv *ShardKV) migrate() {
 	for shard := range kv.sm.MigratingShards {
 		newGroup := kv.sm.Config.Shards[shard]
 		servers := kv.sm.Config.Groups[newGroup]
-		args := MigrateArgs{Shard: shard, Data: kv.dataOfShard(shard), Num: kv.sm.ConfigNum}
+		args := MigrateArgs{Shard: shard, Data: kv.dataOfShard(shard), Num: kv.sm.ConfigNum, LastCommited: kv.copyLastCommited()}
 		kv.say("migrate: shard %v, from %v, to %v", shard, kv.gid, newGroup)
 		go func(s int) {
 			si := 0
@@ -235,7 +248,7 @@ func (kv *ShardKV) migrate() {
 				if ok && reply.Err == OK {
 					break
 				}
-				kv.say("migrate: send Migrate to %v failed, shard %v, Num %v", servers[si], s, kv.sm.ConfigNum)
+				// kv.say("migrate: send Migrate to %v failed, shard %v, Num %v", servers[si], s, kv.sm.ConfigNum)
 				si++
 				si %= len(servers)
 			}
@@ -261,12 +274,15 @@ func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
 	for k, v := range args.Data {
 		data[k] = v
 	}
-	index, _, isLeader := kv.rf.Start(Op{Type: MigrateOp, Migrate: &MigrateInfo{Data: data, Shard: args.Shard, Num: args.Num}})
+	lastCommited := make(map[int64]int)
+	for k, v := range args.LastCommited {
+		lastCommited[k] = v
+	}
+	index, _, isLeader := kv.rf.Start(Op{Type: MigrateOp, Migrate: &MigrateInfo{Data: data, Shard: args.Shard, Num: args.Num, LastCommited: lastCommited}})
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	kv.say("Migrate: start migration shard %v, group %v", args.Shard, kv.gid)
 
 	op := kv.waitIndexCommit(index, 0, 0)
 
@@ -294,6 +310,7 @@ func (kv *ShardKV) recover(snapshot []byte) {
 	var sm *shardManager
 
 	if d.Decode(&store) != nil || d.Decode(&lastCommited) != nil || d.Decode(&sm) != nil {
+		panic("failed to recover")
 	} else {
 		kv.store = store
 		kv.lastCommited = lastCommited
@@ -346,7 +363,7 @@ func (kv *ShardKV) applyOp(op *Op) {
 	op.Err = OK
 
 	if op.Type == ConfigOp {
-		if kv.sm.Migrating() {
+		if kv.sm.Waiting() {
 			kv.say("applyOp: ConfigOp, migrating, drop %#v", op.Config.Config)
 			return
 		}
@@ -366,11 +383,17 @@ func (kv *ShardKV) applyOp(op *Op) {
 			kv.say("applyOp: MigrateOp, duplicate, shard %v, Num %v", op.Migrate.Shard, op.Migrate.Num)
 			return
 		}
-		kv.say("applyOp: MigrateOp, shard %v, Num %v", op.Migrate.Shard, op.Migrate.Num)
+		kv.say("applyOp: MigrateOp, shard %v, Num %v, LastCommited %v", op.Migrate.Shard, op.Migrate.Num, op.Migrate.LastCommited)
 		for k, v := range op.Migrate.Data {
 			kv.store[k] = v
 		}
 		kv.sm.Serve(op.Migrate.Shard)
+
+		for cid, rid := range op.Migrate.LastCommited {
+			if localRID, ok := kv.lastCommited[cid]; !ok || rid > localRID {
+				kv.lastCommited[cid] = rid
+			}
+		}
 
 		return
 	}
@@ -380,6 +403,7 @@ func (kv *ShardKV) applyOp(op *Op) {
 		op.Err = ErrWrongGroup
 		return
 	}
+	kv.say("applyOp: op %v, key %v, value %v, cid %v, rid %v, lastCommited %v", op.Type, op.Key, op.Value, op.CID, op.RID, kv.lastCommited)
 
 	switch op.Type {
 	case PutOp:
@@ -472,9 +496,13 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	kv.say("PutAppend: Start, op %v, key %v, value %v", args.Op, args.Key, args.Value)
 
 	// block on index
 	op := kv.waitIndexCommit(index, args.CID, args.RID)
+	if op.Err == OK {
+		kv.say("PutAppend: OK, op %v, key %v, value %v", args.Op, args.Key, args.Value)
+	}
 
 	reply.Err = op.Err
 }
