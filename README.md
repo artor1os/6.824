@@ -5,4 +5,4 @@ MIT 6.824 2020
 - [x] lab2
 - [x] lab3
 - [x] lab4
-- [ ] lab4 challenge
+- [x] lab4 challenge

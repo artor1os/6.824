@@ -94,27 +94,36 @@ type shardManager struct {
 	ConfigNum       int
 	ServedShards    set
 	WaitingShards   set
-	MigratingShards set
+	// configNum -> shard -> servers
+	MigratingShards map[int]map[int][]string
 	Config *shardmaster.Config
 }
 
 func newShardManager(gid int) *shardManager {
-	sm := &shardManager{GID: gid, ServedShards: newSet(), WaitingShards: newSet(), MigratingShards: newSet()}
+	sm := &shardManager{GID: gid, ServedShards: newSet(), WaitingShards: newSet(), MigratingShards: make(map[int]map[int][]string)}
 	return sm
 }
 
 func (sm *shardManager) Update(config *shardmaster.Config) {
-	if sm.ConfigNum > 0 {
-		sm.updateWaiting(config.Shards)
-		sm.updateMigrating(config.Shards)
+	sm.MigratingShards[config.Num] = make(map[int][]string)
+	for shard := 0; shard < shardmaster.NShards; shard++ {
+		if sm.ConfigNum > 0 && !sm.ServedShards.Contain(shard) && config.Shards[shard] == sm.GID {
+			sm.WaitingShards.Add(shard)
+		}
+
+		if sm.ConfigNum > 0 && sm.ServedShards.Contain(shard) && config.Shards[shard] != sm.GID {
+			sm.MigratingShards[config.Num][shard] = config.Groups[config.Shards[shard]]
+		}
+
+		if config.Shards[shard] != sm.GID {
+			sm.ServedShards.Delete(shard)
+		} else {
+			sm.ServedShards.Add(shard)
+		}
 	}
-	sm.updateServed(config.Shards)
+
 	sm.ConfigNum = config.Num
 	sm.Config = config
-}
-
-func (sm *shardManager) Migrating() bool {
-	return !sm.WaitingShards.Empty() || !sm.MigratingShards.Empty()
 }
 
 func (sm *shardManager) Waiting() bool {
@@ -130,34 +139,8 @@ func (sm *shardManager) Serve(shard int) {
 	sm.WaitingShards.Delete(shard)
 }
 
-func (sm *shardManager) Migrate(shard int) {
-	sm.MigratingShards.Delete(shard)
-}
-
-func (sm *shardManager) updateServed(shards [shardmaster.NShards]int) {
-	for shard := 0; shard < shardmaster.NShards; shard++ {
-		if shards[shard] != sm.GID {
-			sm.ServedShards.Delete(shard)
-		} else {
-			sm.ServedShards.Add(shard)
-		}
-	}
-}
-
-func (sm *shardManager) updateWaiting(shards [shardmaster.NShards]int) {
-	for shard := 0; shard < shardmaster.NShards; shard++ {
-		if !sm.ServedShards.Contain(shard) && shards[shard] == sm.GID {
-			sm.WaitingShards.Add(shard)
-		}
-	}
-}
-
-func (sm *shardManager) updateMigrating(shards [shardmaster.NShards]int) {
-	for shard := 0; shard < shardmaster.NShards; shard++ {
-		if sm.ServedShards.Contain(shard) && shards[shard] != sm.GID {
-			sm.MigratingShards.Add(shard)
-		}
-	}
+func (sm *shardManager) Migrate(configNum int, shard int) {
+	delete(sm.MigratingShards[configNum], shard)
 }
 
 type set map[int]bool
@@ -177,12 +160,6 @@ func (s set) Add(i int) bool {
 
 func (s set) Delete(i int) {
 	delete(s, i)
-}
-
-func (s set) Reset() {
-	for k := range s {
-		delete(s, k)
-	}
 }
 
 func (s set) Empty() bool {
@@ -208,12 +185,11 @@ func (kv *ShardKV) pollConfig() {
 	ticker := time.NewTicker(pollInterval)
 	for range ticker.C {
 		config := kv.mck.Query(kv.sm.ConfigNum+1)
-		if !kv.sm.Migrating() && config.Num > kv.sm.ConfigNum {
+		if !kv.sm.Waiting() && config.Num > kv.sm.ConfigNum {
 			kv.rf.Start(Op{Type: ConfigOp, Config: &ConfigInfo{Config: &config}})
 		}
 	}
 }
-
 
 func (kv *ShardKV) dataOfShard(shard int) map[string]string {
 	data := make(map[string]string)
@@ -233,13 +209,11 @@ func (kv *ShardKV) copyLastCommited() map[int64]int {
 	return r
 }
 
-func (kv *ShardKV) migrate() {
-	for shard := range kv.sm.MigratingShards {
-		newGroup := kv.sm.Config.Shards[shard]
-		servers := kv.sm.Config.Groups[newGroup]
-		args := MigrateArgs{Shard: shard, Data: kv.dataOfShard(shard), Num: kv.sm.ConfigNum, LastCommited: kv.copyLastCommited()}
-		kv.say("migrate: shard %v, from %v, to %v", shard, kv.gid, newGroup)
-		go func(s int) {
+func (kv *ShardKV) migrate(configNum int) {
+	for shard, servers := range kv.sm.MigratingShards[configNum] {
+		args := MigrateArgs{Shard: shard, Data: kv.dataOfShard(shard), Num: configNum, LastCommited: kv.copyLastCommited()}
+		kv.say("migrate: shard %v, from %v, to %v", shard, kv.gid, servers)
+		go func(shard int, servers []string) {
 			si := 0
 			for {
 				reply := MigrateReply{}
@@ -252,11 +226,18 @@ func (kv *ShardKV) migrate() {
 				si++
 				si %= len(servers)
 			}
-			kv.say("migrate: shard %v, from %v, to %v, success", s, kv.gid, newGroup)
+			// kv.say("migrate: shard %v, from %v, to %v, success", s, kv.gid, newGroup)
 			kv.mu.Lock()
-			kv.sm.Migrate(s)
+			kv.sm.Migrate(configNum, shard)
+			if !kv.sm.ServedShards.Contain(shard) {
+				for k := range kv.store {
+					if key2shard(k) == shard {
+						delete(kv.store, k)
+					}
+				}
+			}
 			kv.mu.Unlock()
-		}(shard)
+		}(shard, servers)
 	}
 }
 
@@ -264,7 +245,7 @@ func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
 	kv.mu.Lock()
 	if args.Num > kv.sm.ConfigNum + 1 {
 		reply.Err = ErrWrongLeader
-		kv.say("Migrate: too advanced migration, Shard %v, Num %v", args.Shard, args.Num)
+		kv.say("Migrate: too advanced migration, Shard %v, Num %v, %#v", args.Shard, args.Num, kv.sm)
 		kv.mu.Unlock()
 		return
 	}
@@ -315,7 +296,9 @@ func (kv *ShardKV) recover(snapshot []byte) {
 		kv.store = store
 		kv.lastCommited = lastCommited
 		kv.sm = sm
-		kv.migrate()
+		for configNum := range kv.sm.MigratingShards {
+			kv.migrate(configNum)
+		}
 	}
 }
 
@@ -364,7 +347,7 @@ func (kv *ShardKV) applyOp(op *Op) {
 
 	if op.Type == ConfigOp {
 		if kv.sm.Waiting() {
-			kv.say("applyOp: ConfigOp, migrating, drop %#v", op.Config.Config)
+			kv.say("applyOp: ConfigOp, waiting, drop %#v, %#v", op.Config.Config, kv.sm)
 			return
 		}
 		if op.Config.Config.Num <= kv.sm.ConfigNum {
@@ -373,7 +356,7 @@ func (kv *ShardKV) applyOp(op *Op) {
 		}
 		kv.say("applyOp: ConfigOp, %#v", op.Config.Config)
 		kv.sm.Update(op.Config.Config)
-		kv.migrate()
+		kv.migrate(op.Config.Config.Num)
 		kv.say("applyOp: ConfigOp, after, %#v", kv.sm)
 		return
 	}
@@ -383,7 +366,7 @@ func (kv *ShardKV) applyOp(op *Op) {
 			kv.say("applyOp: MigrateOp, duplicate, shard %v, Num %v", op.Migrate.Shard, op.Migrate.Num)
 			return
 		}
-		kv.say("applyOp: MigrateOp, shard %v, Num %v, LastCommited %v", op.Migrate.Shard, op.Migrate.Num, op.Migrate.LastCommited)
+		kv.say("applyOp: MigrateOp, shard %v, Num %v", op.Migrate.Shard, op.Migrate.Num)
 		for k, v := range op.Migrate.Data {
 			kv.store[k] = v
 		}
@@ -403,7 +386,6 @@ func (kv *ShardKV) applyOp(op *Op) {
 		op.Err = ErrWrongGroup
 		return
 	}
-	kv.say("applyOp: op %v, key %v, value %v, cid %v, rid %v, lastCommited %v", op.Type, op.Key, op.Value, op.CID, op.RID, kv.lastCommited)
 
 	switch op.Type {
 	case PutOp:
