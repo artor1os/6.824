@@ -1,21 +1,13 @@
 package shardmaster
 
+import (
+	"sync"
+	"time"
 
-import "../raft"
-import "../labrpc"
-import "sync"
-import "../labgob"
-import "time"
-import "log"
-
-const Debug = 0
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
-}
+	"../labgob"
+	"../labrpc"
+	"../raft"
+)
 
 type ShardMaster struct {
 	mu      sync.Mutex
@@ -27,10 +19,9 @@ type ShardMaster struct {
 
 	configs []Config // indexed by config num
 
-	indexCh map[int]chan *Op
+	indexCh      map[int]chan *Op
 	lastCommited map[int64]int
 }
-
 
 type Op struct {
 	// Your data here.
@@ -41,9 +32,9 @@ type Op struct {
 
 	WrongLeader bool
 
-	Join *JoinInfo
+	Join  *JoinInfo
 	Leave *LeaveInfo
-	Move *MoveInfo
+	Move  *MoveInfo
 	Query *QueryInfo
 
 	QueryResult *QueryResult
@@ -59,7 +50,7 @@ type LeaveInfo struct {
 
 type MoveInfo struct {
 	Shard int
-	GID int
+	GID   int
 }
 
 type QueryInfo struct {
@@ -71,9 +62,9 @@ type QueryResult struct {
 }
 
 const (
-	JoinOp = "Join"
+	JoinOp  = "Join"
 	LeaveOp = "Leave"
-	MoveOp = "Move"
+	MoveOp  = "Move"
 	QueryOp = "Query"
 )
 
@@ -174,14 +165,13 @@ func rebalance(config *Config) {
 	for i, gid := range config.Shards {
 		if _, ok := config.Groups[gid]; !ok || gid == 0 {
 			config.Shards[i] = gids[0]
-			shardsEachGroup[gids[0]]++	
+			shardsEachGroup[gids[0]]++
 		} else {
 			shardsEachGroup[gid]++
 		}
 	}
 
 	avg := NShards / len(gids)
-	DPrintf("rebalance: shardsEachGroup %v, avg %v", shardsEachGroup, avg)
 
 	for i, gid := range config.Shards {
 		if shardsEachGroup[gid] > avg {
@@ -191,7 +181,10 @@ func rebalance(config *Config) {
 			shardsEachGroup[min]++
 		}
 	}
-	DPrintf("rebalance: final shards %v", config.Shards)
+}
+
+func (sm *ShardMaster) commit(op *Op) {
+	sm.lastCommited[op.CID] = op.RID
 }
 
 func (sm *ShardMaster) applyOp(op *Op) {
@@ -228,7 +221,7 @@ func (sm *ShardMaster) applyOp(op *Op) {
 		op.QueryResult = &QueryResult{Config: sm.configs[index]}
 	}
 	if !sm.isDup(op) {
-		sm.lastCommited[op.CID] = op.RID
+		sm.commit(op)
 	}
 }
 
@@ -296,7 +289,6 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 		reply.Config = op.QueryResult.Config
 	}
 }
-
 
 //
 // the tester calls Kill() when a ShardMaster instance won't

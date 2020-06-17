@@ -8,13 +8,12 @@ import (
 	"../labrpc"
 )
 
-
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	leader int
-	rid int
-	cid int64
+	rid    int
+	cid    int64
 }
 
 func nrand() int64 {
@@ -67,7 +66,7 @@ func (ck *Clerk) Get(key string) string {
 		ck.leader++
 		ck.leader %= len(ck.servers)
 		i++
-		if i % len(ck.servers) == 0 {
+		if i%len(ck.servers) == 0 {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
@@ -102,7 +101,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		ck.leader++
 		ck.leader %= len(ck.servers)
 		i++
-		if i % len(ck.servers) == 0 {
+		if i%len(ck.servers) == 0 {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}

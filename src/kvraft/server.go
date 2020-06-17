@@ -2,7 +2,6 @@ package kvraft
 
 import (
 	"bytes"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,33 +11,24 @@ import (
 	"../raft"
 )
 
-const Debug = 0
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
-}
-
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Type string
-	Key string
+	Type  string
+	Key   string
 	Value string
+
 	KeyNotExist bool
+	WrongLeader bool
+
 	RID int
 	CID int64
-
-	WrongLeader bool
 }
 
 const (
-	GetOp = "Get"
-	PutOp = "Put"
+	GetOp    = "Get"
+	PutOp    = "Put"
 	AppendOp = "Append"
 )
 
@@ -54,12 +44,11 @@ type KVServer struct {
 	// Your definitions here.
 	store map[string]string
 
-	indexCh map[int]chan *Op
+	indexCh      map[int]chan *Op
 	lastCommited map[int64]int
 }
 
 func (kv *KVServer) snapshot(index int) {
-	DPrintf("make snapshot")
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
@@ -71,7 +60,6 @@ func (kv *KVServer) snapshot(index int) {
 }
 
 func (kv *KVServer) recover(snapshot []byte) {
-	DPrintf("recover from snapshot, size %v", len(snapshot))
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 
@@ -79,7 +67,7 @@ func (kv *KVServer) recover(snapshot []byte) {
 	var lastCommited map[int64]int
 
 	if d.Decode(&store) != nil || d.Decode(&lastCommited) != nil {
-		DPrintf("failed to read snapshot")
+		panic("failed to recover")
 	} else {
 		kv.store = store
 		kv.lastCommited = lastCommited
@@ -122,6 +110,10 @@ func (kv *KVServer) isDup(op *Op) bool {
 	return op.RID <= lastCommited
 }
 
+func (kv *KVServer) commit(op *Op) {
+	kv.lastCommited[op.CID] = op.RID
+}
+
 func (kv *KVServer) applyOp(op *Op) {
 	switch op.Type {
 	case PutOp:
@@ -142,7 +134,7 @@ func (kv *KVServer) applyOp(op *Op) {
 		}
 	}
 	if !kv.isDup(op) {
-		kv.lastCommited[op.CID] = op.RID
+		kv.commit(op)
 	}
 }
 
@@ -162,7 +154,6 @@ func (kv *KVServer) waitIndexCommit(index int, cid int64, rid int) *Op {
 		}
 		return op
 	case <-time.After(time.Millisecond * 300):
-		DPrintf("timeout")
 		return &Op{WrongLeader: true}
 	}
 }

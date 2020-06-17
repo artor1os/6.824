@@ -3,9 +3,6 @@ package shardkv
 // import "../shardmaster"
 import (
 	"bytes"
-	"fmt"
-	"log"
-	"os"
 	"sync"
 	"time"
 
@@ -14,24 +11,6 @@ import (
 	"../raft"
 	"../shardmaster"
 )
-
-func init() {
-	f, _ := os.Create("log.log")
-	log.SetOutput(f)
-}
-
-const Debug = 1
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
-}
-
-func (kv *ShardKV) say(format string, a ...interface{}) {
-	DPrintf(fmt.Sprintf("gid %v, me %v:\t", kv.gid, kv.me)+format, a...)
-}
 
 type Op struct {
 	// Your definitions here.
@@ -58,9 +37,9 @@ const (
 )
 
 type MigrateInfo struct {
-	Data  map[string]string
-	Shard int
-	Num   int
+	Data         map[string]string
+	Shard        int
+	Num          int
 	LastCommited map[int64]int
 }
 
@@ -90,13 +69,12 @@ type ShardKV struct {
 }
 
 type shardManager struct {
-	GID             int
-	ConfigNum       int
-	ServedShards    set
-	WaitingShards   set
+	GID           int
+	ConfigNum     int
+	ServedShards  set
+	WaitingShards set
 	// configNum -> shard -> servers
 	MigratingShards map[int]map[int][]string
-	Config *shardmaster.Config
 }
 
 func newShardManager(gid int) *shardManager {
@@ -123,7 +101,6 @@ func (sm *shardManager) Update(config *shardmaster.Config) {
 	}
 
 	sm.ConfigNum = config.Num
-	sm.Config = config
 }
 
 func (sm *shardManager) Waiting() bool {
@@ -184,7 +161,8 @@ const pollInterval = time.Millisecond * 100
 func (kv *ShardKV) pollConfig() {
 	ticker := time.NewTicker(pollInterval)
 	for range ticker.C {
-		config := kv.mck.Query(kv.sm.ConfigNum+1)
+		// No lock is needed here, data race is acceptable
+		config := kv.mck.Query(kv.sm.ConfigNum + 1)
 		if !kv.sm.Waiting() && config.Num > kv.sm.ConfigNum {
 			kv.rf.Start(Op{Type: ConfigOp, Config: &ConfigInfo{Config: &config}})
 		}
@@ -209,10 +187,17 @@ func (kv *ShardKV) copyLastCommited() map[int64]int {
 	return r
 }
 
+func (kv *ShardKV) deleteShard(shard int) {
+	for k := range kv.store {
+		if key2shard(k) == shard {
+			delete(kv.store, k)
+		}
+	}
+}
+
 func (kv *ShardKV) migrate(configNum int) {
 	for shard, servers := range kv.sm.MigratingShards[configNum] {
 		args := MigrateArgs{Shard: shard, Data: kv.dataOfShard(shard), Num: configNum, LastCommited: kv.copyLastCommited()}
-		kv.say("migrate: shard %v, from %v, to %v", shard, kv.gid, servers)
 		go func(shard int, servers []string) {
 			si := 0
 			for {
@@ -222,19 +207,13 @@ func (kv *ShardKV) migrate(configNum int) {
 				if ok && reply.Err == OK {
 					break
 				}
-				// kv.say("migrate: send Migrate to %v failed, shard %v, Num %v", servers[si], s, kv.sm.ConfigNum)
 				si++
 				si %= len(servers)
 			}
-			// kv.say("migrate: shard %v, from %v, to %v, success", s, kv.gid, newGroup)
 			kv.mu.Lock()
 			kv.sm.Migrate(configNum, shard)
 			if !kv.sm.ServedShards.Contain(shard) {
-				for k := range kv.store {
-					if key2shard(k) == shard {
-						delete(kv.store, k)
-					}
-				}
+				kv.deleteShard(shard)
 			}
 			kv.mu.Unlock()
 		}(shard, servers)
@@ -243,9 +222,8 @@ func (kv *ShardKV) migrate(configNum int) {
 
 func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
 	kv.mu.Lock()
-	if args.Num > kv.sm.ConfigNum + 1 {
+	if args.Num > kv.sm.ConfigNum+1 {
 		reply.Err = ErrWrongLeader
-		kv.say("Migrate: too advanced migration, Shard %v, Num %v, %#v", args.Shard, args.Num, kv.sm)
 		kv.mu.Unlock()
 		return
 	}
@@ -265,6 +243,7 @@ func (kv *ShardKV) Migrate(args *MigrateArgs, reply *MigrateReply) {
 		return
 	}
 
+	// No need to check whether applied command is this command
 	op := kv.waitIndexCommit(index, 0, 0)
 
 	reply.Err = op.Err
@@ -346,27 +325,24 @@ func (kv *ShardKV) applyOp(op *Op) {
 	op.Err = OK
 
 	if op.Type == ConfigOp {
+		// Drop config if waiting process of last re-configuration does not end
 		if kv.sm.Waiting() {
-			kv.say("applyOp: ConfigOp, waiting, drop %#v, %#v", op.Config.Config, kv.sm)
 			return
 		}
+		// Detect stale or duplicate config
 		if op.Config.Config.Num <= kv.sm.ConfigNum {
-			kv.say("applyOp: ConfigOp, stale, %#v", op.Config.Config)
 			return
 		}
-		kv.say("applyOp: ConfigOp, %#v", op.Config.Config)
 		kv.sm.Update(op.Config.Config)
 		kv.migrate(op.Config.Config.Num)
-		kv.say("applyOp: ConfigOp, after, %#v", kv.sm)
 		return
 	}
 
 	if op.Type == MigrateOp {
+		// Duplicate migrate
 		if op.Migrate.Num < kv.sm.ConfigNum || kv.sm.ShouldServe(op.Migrate.Shard) {
-			kv.say("applyOp: MigrateOp, duplicate, shard %v, Num %v", op.Migrate.Shard, op.Migrate.Num)
 			return
 		}
-		kv.say("applyOp: MigrateOp, shard %v, Num %v", op.Migrate.Shard, op.Migrate.Num)
 		for k, v := range op.Migrate.Data {
 			kv.store[k] = v
 		}
@@ -382,7 +358,6 @@ func (kv *ShardKV) applyOp(op *Op) {
 	}
 
 	if !kv.shouldServe(op.Key) {
-		kv.say("applyOp: key is migrating, shard %v, not apply this op %#v", key2shard(op.Key), op)
 		op.Err = ErrWrongGroup
 		return
 	}
@@ -433,9 +408,9 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	kv.mu.Lock()
 	if !kv.shouldServe(args.Key) {
-		kv.say("Get: reject key %v, shard %v, %#v", args.Key, key2shard(args.Key), kv.sm)
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
+		// Optimization, maybe useless?
 		if _, isLeader := kv.rf.GetState(); !isLeader {
 			reply.Err = ErrWrongLeader
 		}
@@ -451,9 +426,6 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 	// block on index
 	op := kv.waitIndexCommit(index, args.CID, args.RID)
-	if op.Err == OK {
-		kv.say("Get: OK, key %v", args.Key)
-	}
 
 	reply.Err = op.Err
 	reply.Value = op.Value
@@ -463,7 +435,6 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.mu.Lock()
 	if !kv.shouldServe(args.Key) {
-		kv.say("PutAppend: reject key %v, shard %v, %#v", args.Key, key2shard(args.Key), kv.sm)
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
 		if _, isLeader := kv.rf.GetState(); !isLeader {
@@ -478,13 +449,9 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	kv.say("PutAppend: Start, op %v, key %v, value %v", args.Op, args.Key, args.Value)
 
 	// block on index
 	op := kv.waitIndexCommit(index, args.CID, args.RID)
-	if op.Err == OK {
-		kv.say("PutAppend: OK, op %v, key %v, value %v", args.Op, args.Key, args.Value)
-	}
 
 	reply.Err = op.Err
 }
@@ -554,8 +521,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	go kv.apply()
 	go kv.pollConfig()
-
-	kv.say("START")
 
 	return kv
 }

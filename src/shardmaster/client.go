@@ -4,17 +4,20 @@ package shardmaster
 // Shardmaster clerk.
 //
 
-import "../labrpc"
-import "time"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"time"
+
+	"../labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
 	leader int
-	rid int
-	cid int64
+	rid    int
+	cid    int64
 }
 
 func nrand() int64 {
@@ -43,13 +46,13 @@ func (ck *Clerk) Query(num int) Config {
 	for {
 		reply := QueryReply{}
 		ok := ck.servers[ck.leader].Call("ShardMaster.Query", args, &reply)
-		if ok && reply.WrongLeader == false {
+		if ok && !reply.WrongLeader {
 			return reply.Config
 		}
 		ck.leader++
 		ck.leader %= len(ck.servers)
 		i++
-		if i % len(ck.servers) == 0 {
+		if i%len(ck.servers) == 0 {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
@@ -66,13 +69,13 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	for {
 		reply := JoinReply{}
 		ok := ck.servers[ck.leader].Call("ShardMaster.Join", args, &reply)
-		if ok && reply.WrongLeader == false {
+		if ok && !reply.WrongLeader {
 			return
 		}
 		ck.leader++
 		ck.leader %= len(ck.servers)
 		i++
-		if i % len(ck.servers) == 0 {
+		if i%len(ck.servers) == 0 {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
@@ -89,13 +92,13 @@ func (ck *Clerk) Leave(gids []int) {
 	for {
 		reply := LeaveReply{}
 		ok := ck.servers[ck.leader].Call("ShardMaster.Leave", args, &reply)
-		if ok && reply.WrongLeader == false {
+		if ok && !reply.WrongLeader {
 			return
 		}
 		ck.leader++
 		ck.leader %= len(ck.servers)
 		i++
-		if i % len(ck.servers) == 0 {
+		if i%len(ck.servers) == 0 {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
@@ -113,13 +116,13 @@ func (ck *Clerk) Move(shard int, gid int) {
 	for {
 		reply := MoveReply{}
 		ok := ck.servers[ck.leader].Call("ShardMaster.Move", args, &reply)
-		if ok && reply.WrongLeader == false {
+		if ok && !reply.WrongLeader {
 			return
 		}
 		ck.leader++
 		ck.leader %= len(ck.servers)
 		i++
-		if i % len(ck.servers) == 0 {
+		if i%len(ck.servers) == 0 {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}

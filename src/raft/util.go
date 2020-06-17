@@ -2,7 +2,6 @@ package raft
 
 import (
 	"log"
-	// "os"
 	"math/rand"
 	"time"
 )
@@ -24,8 +23,6 @@ func DPrintln(a ...interface{}) {
 }
 
 func init() {
-	// f, _ := os.Create("log.log")
-	// log.SetOutput(f)
 	rand.Seed(time.Now().UnixNano())
 }
 

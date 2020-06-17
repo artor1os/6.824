@@ -48,9 +48,9 @@ type GetReply struct {
 }
 
 type MigrateArgs struct {
-	Shard int
-	Data map[string]string
-	Num int
+	Shard        int
+	Data         map[string]string
+	Num          int
 	LastCommited map[int64]int
 }
 
